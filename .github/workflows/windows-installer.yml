@@ -29,10 +29,15 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt -r requirements-build.txt
 
+      - name: Smoke-test OCR import
+        shell: pwsh
+        run: |
+          python -c "from rapidocr import RapidOCR; print('RapidOCR OK')"
+
       - name: Build application
         shell: pwsh
         run: |
-          python -m PyInstaller --noconfirm --clean --windowed --name FlashTrombi --add-data "app.py;." --collect-all streamlit --collect-all altair launcher.py
+          python -m PyInstaller --noconfirm --clean --windowed --name FlashTrombi --add-data "app.py;." --collect-all streamlit --collect-all altair --collect-all rapidocr --collect-all onnxruntime launcher.py
 
       - name: Install Inno Setup
         shell: pwsh
