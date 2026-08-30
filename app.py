@@ -138,6 +138,7 @@ else:
             session = start_or_resume_session(class_id)
             st.session_state["session_id"] = session["id"]
             st.session_state.pop("current_student", None)
+            st.session_state.pop("answer_revealed", None)
             st.session_state.pop("answer_result", None)
             st.rerun()
         except Exception as exc:
@@ -160,11 +161,13 @@ else:
     if session.get("completed_at"):
         st.success("Session terminée 🎉")
         st.session_state.pop("current_student", None)
+        st.session_state.pop("answer_revealed", None)
         st.session_state.pop("answer_result", None)
         st.stop()
 
     if "current_student" not in st.session_state:
         st.session_state["current_student"] = next_student(session_id)
+        st.session_state["answer_revealed"] = False
         st.session_state.pop("answer_result", None)
 
     student = st.session_state.get("current_student")
@@ -181,8 +184,18 @@ else:
 
     with right:
         result = st.session_state.get("answer_result")
-        if result is None:
-            st.markdown("### Est-ce que tu l'avais ?")
+        answer_revealed = st.session_state.get("answer_revealed", False)
+
+        if result is None and not answer_revealed:
+            st.markdown("### Donne son nom, puis vérifie")
+            st.caption("Réponds mentalement ou à voix haute avant d'afficher la réponse.")
+            if st.button("👀 Afficher le nom", type="primary", use_container_width=True):
+                st.session_state["answer_revealed"] = True
+                st.rerun()
+
+        elif result is None:
+            show_answer(student)
+            st.markdown("### Tu l'avais ?")
             b1, b2 = st.columns(2)
             if b1.button("✅ Oui", type="primary", use_container_width=True):
                 st.session_state["answer_result"] = record_answer(session_id, student["id"], True)
@@ -190,6 +203,7 @@ else:
             if b2.button("❌ Non", use_container_width=True):
                 st.session_state["answer_result"] = record_answer(session_id, student["id"], False)
                 st.rerun()
+
         else:
             show_answer(student)
             if result["status"] == "memorise" and result["memory_dates"]:
@@ -200,6 +214,7 @@ else:
                 st.success("Les élèves du groupe sont terminés pour aujourd'hui.")
             elif st.button("➡️ Élève suivant", type="primary", use_container_width=True):
                 st.session_state["current_student"] = next_student(session_id)
+                st.session_state["answer_revealed"] = False
                 st.session_state.pop("answer_result", None)
                 st.rerun()
 
@@ -216,5 +231,6 @@ else:
         end_session(session_id)
         st.session_state.pop("session_id", None)
         st.session_state.pop("current_student", None)
+        st.session_state.pop("answer_revealed", None)
         st.session_state.pop("answer_result", None)
         st.rerun()
