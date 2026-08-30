@@ -12,6 +12,8 @@ python -m PyInstaller `
   --add-data "app.py;." `
   --collect-all streamlit `
   --collect-all altair `
+  --collect-all rapidocr `
+  --collect-all onnxruntime `
   launcher.py
 
 $IsccCandidates = @(
