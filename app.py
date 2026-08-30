@@ -1,6 +1,6 @@
-import io
 import random
 import re
+import statistics
 from typing import Dict, List, Tuple
 
 import fitz  # PyMuPDF
@@ -20,6 +20,7 @@ CLASS_PATTERNS = [
 STOP_WORDS = {
     "classe", "trombinoscope", "eleve", "élève", "annee", "année", "photo",
     "nom", "prenom", "prénom", "professeur", "principal", "principale",
+    "groupe", "effectif", "collège", "college", "lycée", "lycee",
 }
 
 
@@ -30,23 +31,25 @@ def normalize_spaces(text: str) -> str:
 def detect_class(top_lines: List[str], page_number: int) -> str:
     text = " | ".join(normalize_spaces(x) for x in top_lines if normalize_spaces(x))
     for pattern in CLASS_PATTERNS:
-        m = pattern.search(text)
-        if m:
-            value = " ".join(x for x in m.groups() if x).upper().replace("  ", " ")
+        match = pattern.search(text)
+        if match:
+            value = " ".join(x for x in match.groups() if x).upper().replace("  ", " ")
             return value
     return f"Page {page_number}"
 
 
 def looks_like_name(text: str) -> bool:
-    t = normalize_spaces(text)
-    if not t or len(t) < 3 or len(t) > 70:
+    value = normalize_spaces(text)
+    if not value or len(value) < 3 or len(value) > 70:
         return False
-    low = t.lower()
+
+    low = value.lower()
     if any(word in low.split() for word in STOP_WORDS):
         return False
-    if re.search(r"@|https?://|www\.|\d{3,}", t, re.I):
+    if re.search(r"@|https?://|www\.|\d{3,}", value, re.I):
         return False
-    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ'’-]+", t)
+
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ'’-]+", value)
     return 2 <= len(words) <= 6
 
 
@@ -60,20 +63,22 @@ def split_name(full_name: str) -> Tuple[str, str]:
     uppercase_words = []
     remainder = []
     upper_phase = True
-    for w in words:
-        letters = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ]", "", w)
+
+    for word in words:
+        letters = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ]", "", word)
         is_upper = bool(letters) and letters == letters.upper()
         if upper_phase and is_upper:
-            uppercase_words.append(w)
+            uppercase_words.append(word)
         else:
             upper_phase = False
-            remainder.append(w)
+            remainder.append(word)
 
     if uppercase_words and remainder:
         return " ".join(uppercase_words).title(), " ".join(remainder).title()
 
     if len(words) >= 2:
         return " ".join(words[1:]).title(), words[0].title()
+
     return text.title(), ""
 
 
@@ -110,74 +115,262 @@ def candidate_score(img_box: fitz.Rect, text_box: fitz.Rect) -> float:
     return vertical_gap + 0.25 * center_gap + direction_penalty - 35.0 * overlap_ratio
 
 
+def cluster_values(values: List[float], tolerance: float) -> List[List[float]]:
+    if not values:
+        return []
+
+    ordered = sorted(values)
+    clusters: List[List[float]] = [[ordered[0]]]
+    for value in ordered[1:]:
+        current_center = sum(clusters[-1]) / len(clusters[-1])
+        if abs(value - current_center) <= tolerance:
+            clusters[-1].append(value)
+        else:
+            clusters.append([value])
+    return clusters
+
+
+def classic_grid_name_anchors(lines: List[Dict], page_rect: fitz.Rect) -> List[Dict]:
+    """Repère des lignes de noms organisées en grille dans un PDF imprimé/aplati."""
+    candidates = []
+    for line in lines:
+        bbox = line["bbox"]
+        if bbox.y0 < page_rect.height * 0.12:
+            continue
+        if bbox.width > page_rect.width * 0.45:
+            continue
+        if looks_like_name(line["text"]):
+            candidates.append(line)
+
+    if len(candidates) < 3:
+        return []
+
+    heights = [max(1.0, candidate["bbox"].height) for candidate in candidates]
+    row_tolerance = max(10.0, statistics.median(heights) * 1.8)
+    ordered = sorted(candidates, key=lambda candidate: (candidate["bbox"].y0, candidate["bbox"].x0))
+
+    rows: List[List[Dict]] = []
+    for candidate in ordered:
+        cy = (candidate["bbox"].y0 + candidate["bbox"].y1) / 2
+        placed = False
+        for row in rows:
+            row_cy = statistics.mean(
+                (item["bbox"].y0 + item["bbox"].y1) / 2 for item in row
+            )
+            if abs(cy - row_cy) <= row_tolerance:
+                row.append(candidate)
+                placed = True
+                break
+        if not placed:
+            rows.append([candidate])
+
+    grid_rows = [row for row in rows if len(row) >= 2]
+    anchors = [
+        item
+        for row in grid_rows
+        for item in sorted(row, key=lambda candidate: candidate["bbox"].x0)
+    ]
+    return anchors if len(anchors) >= 3 else []
+
+
+def estimate_grid_crop(anchors: List[Dict], anchor: Dict, page_rect: fitz.Rect) -> fitz.Rect:
+    centers_x = sorted(
+        (item["bbox"].x0 + item["bbox"].x1) / 2
+        for item in anchors
+    )
+    centers_y = sorted(
+        (item["bbox"].y0 + item["bbox"].y1) / 2
+        for item in anchors
+    )
+
+    x_clusters = cluster_values(centers_x, tolerance=max(18.0, page_rect.width * 0.035))
+    y_clusters = cluster_values(centers_y, tolerance=max(12.0, page_rect.height * 0.018))
+    col_centers = [statistics.mean(cluster) for cluster in x_clusters]
+    row_centers = [statistics.mean(cluster) for cluster in y_clusters]
+
+    col_gaps = [
+        right - left
+        for left, right in zip(col_centers, col_centers[1:])
+        if right - left > 25
+    ]
+    row_gaps = [
+        bottom - top
+        for top, bottom in zip(row_centers, row_centers[1:])
+        if bottom - top > 35
+    ]
+
+    default_col_gap = page_rect.width / max(3, min(6, len(col_centers) or 4))
+    default_row_gap = page_rect.height / max(3, min(7, len(row_centers) or 5))
+
+    col_gap = statistics.median(col_gaps) if col_gaps else default_col_gap
+    row_gap = statistics.median(row_gaps) if row_gaps else default_row_gap
+
+    bbox = anchor["bbox"]
+    center_x = (bbox.x0 + bbox.x1) / 2
+
+    crop_width = min(170.0, max(72.0, col_gap * 0.82))
+    crop_height = min(175.0, max(78.0, row_gap * 0.76))
+
+    bottom = max(page_rect.y0 + 20.0, bbox.y0 - 3.0)
+    top = max(page_rect.y0, bottom - crop_height)
+    left = max(page_rect.x0, center_x - crop_width / 2)
+    right = min(page_rect.x1, center_x + crop_width / 2)
+
+    if right - left < crop_width:
+        if left <= page_rect.x0:
+            right = min(page_rect.x1, left + crop_width)
+        elif right >= page_rect.x1:
+            left = max(page_rect.x0, right - crop_width)
+
+    return fitz.Rect(left, top, right, bottom)
+
+
+def extract_from_rendered_grid(
+    page: fitz.Page,
+    lines: List[Dict],
+    class_name: str,
+    page_number: int,
+) -> List[Dict]:
+    """Fallback pour les PDF créés via Imprimer / Enregistrer en PDF.
+
+    La page est rendue en bitmap puis chaque portrait est recadré au-dessus
+    de son nom. Aucun OCR n'est nécessaire tant que les noms restent du texte.
+    """
+    anchors = classic_grid_name_anchors(lines, page.rect)
+    if not anchors:
+        return []
+
+    students = []
+    for index, anchor in enumerate(anchors, start=1):
+        full_name = normalize_spaces(anchor["text"])
+        nom, prenom = split_name(full_name)
+        clip = estimate_grid_crop(anchors, anchor, page.rect)
+
+        pixmap = page.get_pixmap(
+            matrix=fitz.Matrix(2.0, 2.0),
+            clip=clip,
+            alpha=False,
+        )
+
+        students.append(
+            {
+                "id": f"p{page_number}_r{index}",
+                "classe": class_name,
+                "nom": nom,
+                "prenom": prenom,
+                "nom_complet": full_name,
+                "page": page_number,
+                "image_bytes": pixmap.tobytes("png"),
+                "image_ext": "png",
+                "source": "page imprimée",
+            }
+        )
+    return students
+
+
+def extract_embedded_portraits(
+    page: fitz.Page,
+    page_dict: Dict,
+    lines: List[Dict],
+    class_name: str,
+    page_number: int,
+) -> List[Dict]:
+    students = []
+    image_blocks = [
+        block
+        for block in page_dict.get("blocks", [])
+        if block.get("type") == 1 and block.get("image")
+    ]
+
+    for img_idx, block in enumerate(image_blocks):
+        bbox = fitz.Rect(block.get("bbox", (0, 0, 0, 0)))
+        if bbox.width < 45 or bbox.height < 55:
+            continue
+
+        aspect = bbox.width / max(1.0, bbox.height)
+        if not 0.45 <= aspect <= 1.35:
+            continue
+
+        nearby = []
+        for line in lines:
+            text_box = line["bbox"]
+            if text_box.y0 > bbox.y1 + 130 or text_box.y1 < bbox.y0 - 90:
+                continue
+            if text_box.x1 < bbox.x0 - 45 or text_box.x0 > bbox.x1 + 45:
+                continue
+            if looks_like_name(line["text"]):
+                nearby.append((candidate_score(bbox, text_box), line["text"]))
+
+        if not nearby:
+            continue
+
+        nearby.sort(key=lambda item: item[0])
+        full_name = normalize_spaces(nearby[0][1])
+        nom, prenom = split_name(full_name)
+
+        students.append(
+            {
+                "id": f"p{page_number}_i{img_idx + 1}",
+                "classe": class_name,
+                "nom": nom,
+                "prenom": prenom,
+                "nom_complet": full_name,
+                "page": page_number,
+                "image_bytes": block["image"],
+                "image_ext": block.get("ext", "png") or "png",
+                "source": "image PDF",
+            }
+        )
+
+    return students
+
+
 def extract_trombinoscope(pdf_bytes: bytes) -> List[Dict]:
     students: List[Dict] = []
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     for page_idx, page in enumerate(doc):
+        page_number = page_idx + 1
         page_dict = page.get_text("dict")
         lines = line_records(page_dict)
-        top_lines = [x["text"] for x in lines if x["bbox"].y1 <= page.rect.height * 0.28]
-        class_name = detect_class(top_lines, page_idx + 1)
+        top_lines = [
+            item["text"]
+            for item in lines
+            if item["bbox"].y1 <= page.rect.height * 0.28
+        ]
+        class_name = detect_class(top_lines, page_number)
 
-        image_blocks = [b for b in page_dict.get("blocks", []) if b.get("type") == 1 and b.get("image")]
+        page_students = extract_embedded_portraits(
+            page, page_dict, lines, class_name, page_number
+        )
 
-        for img_idx, block in enumerate(image_blocks):
-            bbox = fitz.Rect(block.get("bbox", (0, 0, 0, 0)))
-            if bbox.width < 45 or bbox.height < 55:
-                continue
-            aspect = bbox.width / max(1.0, bbox.height)
-            if not 0.45 <= aspect <= 1.35:
-                continue
+        if not page_students:
+            page_students = extract_from_rendered_grid(
+                page, lines, class_name, page_number
+            )
 
-            nearby = []
-            for line in lines:
-                tb = line["bbox"]
-                if tb.y0 > bbox.y1 + 130 or tb.y1 < bbox.y0 - 90:
-                    continue
-                if tb.x1 < bbox.x0 - 45 or tb.x0 > bbox.x1 + 45:
-                    continue
-                if looks_like_name(line["text"]):
-                    nearby.append((candidate_score(bbox, tb), line["text"]))
-
-            if not nearby:
-                continue
-
-            nearby.sort(key=lambda x: x[0])
-            full_name = normalize_spaces(nearby[0][1])
-            nom, prenom = split_name(full_name)
-            image_bytes = block["image"]
-            ext = block.get("ext", "png") or "png"
-
-            students.append({
-                "id": f"p{page_idx + 1}_i{img_idx + 1}",
-                "classe": class_name,
-                "nom": nom,
-                "prenom": prenom,
-                "nom_complet": full_name,
-                "page": page_idx + 1,
-                "image_bytes": image_bytes,
-                "image_ext": ext,
-            })
+        students.extend(page_students)
 
     return students
 
 
 def editable_dataframe(students: List[Dict]) -> pd.DataFrame:
-    return pd.DataFrame([
-        {
-            "id": s["id"],
-            "classe": s["classe"],
-            "nom": s["nom"],
-            "prenom": s["prenom"],
-            "page": s["page"],
-        }
-        for s in students
-    ])
+    return pd.DataFrame(
+        [
+            {
+                "id": student["id"],
+                "classe": student["classe"],
+                "nom": student["nom"],
+                "prenom": student["prenom"],
+                "page": student["page"],
+            }
+            for student in students
+        ]
+    )
 
 
 def student_lookup(students: List[Dict]) -> Dict[str, Dict]:
-    return {s["id"]: s for s in students}
+    return {student["id"]: student for student in students}
 
 
 st.title("🧑‍🎓 Flash Trombinoscope")
@@ -206,12 +399,21 @@ if uploaded is not None:
     students = st.session_state.get("students", [])
     if not students:
         st.warning(
-            "Aucun portrait exploitable n'a été détecté. Le PDF contient peut-être des pages scannées "
-            "ou une mise en page différente. Dans ce cas, il faudra ajouter un mode OCR / import CSV."
+            "Aucun portrait n'a été détecté. Si le PDF est une impression, "
+            "le mode 'page imprimée' fonctionne tant que les noms sont encore "
+            "sélectionnables dans le PDF. Si même le texte est aplati en image, "
+            "il faudra ajouter un OCR."
         )
         st.stop()
 
-    st.success(f"{len(students)} portraits détectés.")
+    printed_count = sum(student.get("source") == "page imprimée" for student in students)
+    if printed_count:
+        st.success(
+            f"{len(students)} portraits détectés, dont {printed_count} "
+            "par recadrage d'une page imprimée."
+        )
+    else:
+        st.success(f"{len(students)} portraits détectés.")
 
     base_df = editable_dataframe(students)
     st.subheader("1. Vérifier / corriger l'extraction")
@@ -242,9 +444,9 @@ if uploaded is not None:
     st.divider()
     st.subheader("2. Flash card")
 
-    classes = sorted({s["classe"] for s in students})
+    classes = sorted({student["classe"] for student in students})
     selected_class = st.selectbox("Classe", classes)
-    pool = [s for s in students if s["classe"] == selected_class]
+    pool = [student for student in students if student["classe"] == selected_class]
     st.caption(f"{len(pool)} élève(s) dans cette classe.")
 
     c1, c2 = st.columns([1, 4])
@@ -267,8 +469,11 @@ if uploaded is not None:
             st.markdown("### Réponse")
             if st.button("👀 Afficher le nom", use_container_width=True):
                 st.session_state.reveal = True
+
             if st.session_state.get("reveal"):
-                display_name = " ".join(x for x in [current["prenom"], current["nom"]] if x).strip()
+                display_name = " ".join(
+                    value for value in [current["prenom"], current["nom"]] if value
+                ).strip()
                 st.success(display_name or "Nom non renseigné")
                 st.caption(f"Classe : {current['classe']} · page {current['page']}")
 
@@ -283,6 +488,7 @@ if uploaded is not None:
 
 else:
     st.markdown(
-        "**Format conseillé :** un PDF avec des portraits intégrés et un nom placé sous chaque photo. "
-        "Les PDF entièrement scannés nécessitent un OCR, non activé dans cette version."
+        "**Formats pris en charge :** PDF avec portraits intégrés, ou PDF créé via "
+        "« Imprimer / Enregistrer en PDF » avec noms encore sélectionnables. "
+        "Un document entièrement aplati en image nécessite un OCR."
     )
