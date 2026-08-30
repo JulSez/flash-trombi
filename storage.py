@@ -1,18 +1,19 @@
 from __future__ import annotations
 
+import io
 import random
 import re
 import shutil
 import sqlite3
+import tempfile
+import zipfile
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence
 
+from paths import CLASSES_DIR, DATA_DIR, DB_PATH, ensure_data_dirs
 from pdf_import import extract_cards
-
-DATA_DIR = Path("data")
-DB_PATH = DATA_DIR / "flash_trombi.sqlite3"
 
 STATUS_NON_COMMENCE = "non_commence"
 STATUS_VU = "vu"
@@ -41,9 +42,26 @@ def _slugify(value: str) -> str:
     return value[:60] or "classe"
 
 
+def _stored_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(DATA_DIR.resolve()))
+    except ValueError:
+        return str(path)
+
+
+def resolve_data_path(value: str) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    parts = path.parts
+    if parts and parts[0].lower() == "data":
+        path = Path(*parts[1:])
+    return DATA_DIR / path
+
+
 @contextmanager
 def connect():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_data_dirs()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -58,6 +76,7 @@ def connect():
 
 
 def init_db() -> None:
+    ensure_data_dirs()
     with connect() as conn:
         conn.executescript(
             """
@@ -123,42 +142,58 @@ def init_db() -> None:
         )
 
 
+def class_name_exists(name: str) -> bool:
+    init_db()
+    with connect() as conn:
+        row = conn.execute("SELECT 1 FROM classes WHERE name=? COLLATE NOCASE", (name.strip(),)).fetchone()
+        return bool(row)
+
+
+def analyze_pdf(pdf_bytes: bytes) -> List[Dict]:
+    return extract_cards(pdf_bytes)
+
+
 def create_class(name: str, pdf_bytes: bytes) -> int:
+    cards = analyze_pdf(pdf_bytes)
+    return create_class_from_cards(name, pdf_bytes, cards)
+
+
+def create_class_from_cards(name: str, pdf_bytes: bytes, cards: Sequence[Dict]) -> int:
     init_db()
     name = name.strip()
     if not name:
-        raise ValueError("Le nom de la classe est obligatoire.")
-
-    cards = extract_cards(pdf_bytes)
+        raise ValueError("Donne un nom à la classe.")
     if not cards:
-        raise ValueError("Aucun portrait n'a été détecté dans ce PDF.")
+        raise ValueError("Aucun portrait sélectionné.")
 
-    class_id = None
-    folder = None
+    class_id: Optional[int] = None
+    folder: Optional[Path] = None
     try:
         with connect() as conn:
             cursor = conn.execute(
                 "INSERT INTO classes(name, created_at) VALUES (?, ?)",
                 (name, _now()),
             )
-            class_id = cursor.lastrowid
-            folder = DATA_DIR / "classes" / f"{class_id:04d}-{_slugify(name)}"
+            class_id = int(cursor.lastrowid)
+            folder = CLASSES_DIR / f"{class_id:04d}-{_slugify(name)}"
             portraits_dir = folder / "portraits"
             labels_dir = folder / "labels"
             portraits_dir.mkdir(parents=True, exist_ok=False)
             labels_dir.mkdir(parents=True, exist_ok=False)
 
-            pdf_path = folder / "source.pdf"
+            pdf_path = folder / "trombinoscope.pdf"
             pdf_path.write_bytes(pdf_bytes)
             conn.execute(
                 "UPDATE classes SET folder_path=?, pdf_path=? WHERE id=?",
-                (str(folder), str(pdf_path), class_id),
+                (_stored_path(folder), _stored_path(pdf_path), class_id),
             )
 
-            for card in cards:
-                ext = card["photo_ext"].lower().replace("jpeg", "jpg")
-                photo_path = portraits_dir / f"student_{card['position']:03d}.{ext}"
-                label_path = labels_dir / f"student_{card['position']:03d}.png"
+            for new_position, card in enumerate(cards, start=1):
+                ext = str(card.get("photo_ext", "jpg")).lower().replace("jpeg", "jpg")
+                if ext not in {"jpg", "png", "webp"}:
+                    ext = "jpg"
+                photo_path = portraits_dir / f"student_{new_position:03d}.{ext}"
+                label_path = labels_dir / f"student_{new_position:03d}.png"
                 photo_path.write_bytes(card["photo_bytes"])
                 label_path.write_bytes(card["label_bytes"])
                 conn.execute(
@@ -169,15 +204,15 @@ def create_class(name: str, pdf_bytes: bytes) -> int:
                     """,
                     (
                         class_id,
-                        card["external_key"],
-                        card["position"],
-                        card["page"],
-                        str(photo_path),
-                        str(label_path),
+                        card.get("external_key") or f"n{new_position:03d}",
+                        new_position,
+                        int(card.get("page", 1)),
+                        _stored_path(photo_path),
+                        _stored_path(label_path),
                         _now(),
                     ),
                 )
-        return int(class_id)
+        return class_id
     except sqlite3.IntegrityError as exc:
         if folder and folder.exists():
             shutil.rmtree(folder, ignore_errors=True)
@@ -199,7 +234,7 @@ def list_classes() -> List[Dict]:
             FROM classes c
             LEFT JOIN students s ON s.class_id=c.id
             GROUP BY c.id
-            ORDER BY c.name
+            ORDER BY c.name COLLATE NOCASE
             """
         ).fetchall()
         return [dict(row) for row in rows]
@@ -209,6 +244,17 @@ def get_class(class_id: int) -> Optional[Dict]:
     with connect() as conn:
         row = conn.execute("SELECT * FROM classes WHERE id=?", (class_id,)).fetchone()
         return dict(row) if row else None
+
+
+def delete_class(class_id: int) -> None:
+    with connect() as conn:
+        row = conn.execute("SELECT folder_path FROM classes WHERE id=?", (class_id,)).fetchone()
+        if not row:
+            return
+        folder = resolve_data_path(row["folder_path"])
+        conn.execute("DELETE FROM classes WHERE id=?", (class_id,))
+    if folder.exists():
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 def memory_dates(conn: sqlite3.Connection, student_id: int, cycle_no: int) -> List[str]:
@@ -223,6 +269,15 @@ def memory_dates(conn: sqlite3.Connection, student_id: int, cycle_no: int) -> Li
     return [row["memory_date"] for row in rows]
 
 
+def _student_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> Dict:
+    item = dict(row)
+    item["photo_path"] = str(resolve_data_path(item["photo_path"]))
+    if item.get("label_path"):
+        item["label_path"] = str(resolve_data_path(item["label_path"]))
+    item["memory_dates"] = memory_dates(conn, item["id"], item["cycle_no"])
+    return item
+
+
 def get_students(class_id: int) -> List[Dict]:
     init_db()
     with connect() as conn:
@@ -230,12 +285,7 @@ def get_students(class_id: int) -> List[Dict]:
             "SELECT * FROM students WHERE class_id=? ORDER BY position",
             (class_id,),
         ).fetchall()
-        result = []
-        for row in rows:
-            item = dict(row)
-            item["memory_dates"] = memory_dates(conn, item["id"], item["cycle_no"])
-            result.append(item)
-        return result
+        return [_student_dict(conn, row) for row in rows]
 
 
 def update_student_name(student_id: int, first_name: str, last_name: str) -> None:
@@ -253,22 +303,21 @@ def class_stats(class_id: int) -> Dict[str, int]:
             (class_id,),
         ).fetchall()
     stats = {status: 0 for status in STATUS_LABELS}
-    stats.update({row["status"]: row["n"] for row in rows})
+    stats.update({row["status"]: int(row["n"]) for row in rows})
     stats["total"] = sum(stats.values())
     return stats
 
 
 def _shuffle_take(rows: Iterable[sqlite3.Row], remaining: int) -> List[int]:
-    ids = [row["id"] for row in rows]
+    ids = [int(row["id"]) for row in rows]
     random.shuffle(ids)
     return ids[:remaining]
 
 
-def start_or_resume_session(class_id: int, on_date: Optional[date] = None) -> Dict:
-    init_db()
+def get_today_open_session(class_id: int, on_date: Optional[date] = None) -> Optional[Dict]:
     today = _today(on_date)
     with connect() as conn:
-        open_session = conn.execute(
+        row = conn.execute(
             """
             SELECT * FROM sessions
             WHERE class_id=? AND session_date=? AND completed_at IS NULL
@@ -276,9 +325,17 @@ def start_or_resume_session(class_id: int, on_date: Optional[date] = None) -> Di
             """,
             (class_id, today),
         ).fetchone()
-        if open_session:
-            return dict(open_session)
+        return dict(row) if row else None
 
+
+def start_or_resume_session(class_id: int, on_date: Optional[date] = None) -> Dict:
+    init_db()
+    today = _today(on_date)
+    existing = get_today_open_session(class_id, on_date)
+    if existing:
+        return existing
+
+    with connect() as conn:
         students = conn.execute(
             "SELECT * FROM students WHERE class_id=? ORDER BY position",
             (class_id,),
@@ -314,7 +371,7 @@ def start_or_resume_session(class_id: int, on_date: Optional[date] = None) -> Di
 
         if not selected:
             raise ValueError(
-                "Rien à travailler aujourd'hui : les élèves non acquis ont déjà été mémorisés aujourd'hui."
+                "Rien à travailler pour le moment : les élèves à réviser ont déjà été faits aujourd'hui."
             )
 
         cursor = conn.execute(
@@ -324,7 +381,7 @@ def start_or_resume_session(class_id: int, on_date: Optional[date] = None) -> Di
             """,
             (class_id, today, _now(), maintenance),
         )
-        session_id = cursor.lastrowid
+        session_id = int(cursor.lastrowid)
 
         for student_id in selected:
             student = conn.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
@@ -337,10 +394,7 @@ def start_or_resume_session(class_id: int, on_date: Optional[date] = None) -> Di
                 (session_id, student_id, initial_status),
             )
             if initial_status == STATUS_NON_COMMENCE:
-                conn.execute(
-                    "UPDATE students SET status=? WHERE id=?",
-                    (STATUS_VU, student_id),
-                )
+                conn.execute("UPDATE students SET status=? WHERE id=?", (STATUS_VU, student_id))
 
         return dict(conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone())
 
@@ -363,12 +417,7 @@ def get_session_students(session_id: int) -> List[Dict]:
             """,
             (session_id,),
         ).fetchall()
-        result = []
-        for row in rows:
-            item = dict(row)
-            item["memory_dates"] = memory_dates(conn, item["id"], item["cycle_no"])
-            result.append(item)
-        return result
+        return [_student_dict(conn, row) for row in rows]
 
 
 def next_student(session_id: int) -> Optional[Dict]:
@@ -393,17 +442,28 @@ def next_student(session_id: int) -> Optional[Dict]:
             """,
             (session_id,),
         ).fetchall()
-        recent = [row["student_id"] for row in recent_rows]
+        recent = [int(row["student_id"]) for row in recent_rows]
 
-        chosen_pool = list(rows)
+        candidates = list(rows)
         for blocked_count in range(len(recent), -1, -1):
             blocked = set(recent[:blocked_count])
-            candidates = [row for row in rows if row["id"] not in blocked]
-            if candidates:
-                chosen_pool = candidates
+            pool = [row for row in rows if row["id"] not in blocked]
+            if pool:
+                candidates = pool
                 break
 
-        return dict(random.choice(chosen_pool))
+        return _student_dict(conn, random.choice(candidates))
+
+
+def _finish_session_if_needed(conn: sqlite3.Connection, session_id: int) -> bool:
+    remaining = conn.execute(
+        "SELECT COUNT(*) AS n FROM session_students WHERE session_id=? AND completed=0",
+        (session_id,),
+    ).fetchone()["n"]
+    if remaining == 0:
+        conn.execute("UPDATE sessions SET completed_at=? WHERE id=?", (_now(), session_id))
+        return True
+    return False
 
 
 def record_answer(session_id: int, student_id: int, correct: bool, on_date: Optional[date] = None) -> Dict:
@@ -426,13 +486,21 @@ def record_answer(session_id: int, student_id: int, correct: bool, on_date: Opti
             (session_id, student_id, _now(), int(bool(correct))),
         )
 
-        message = ""
-        correct_count = ss["correct_count"]
+        correct_count = int(ss["correct_count"])
         completed = 0
+        message = ""
 
         if session["maintenance_mode"]:
             completed = 1
-            message = "Révision d'entretien terminée pour cet élève."
+            if correct:
+                message = "Toujours acquis 👍"
+            else:
+                new_cycle = int(student["cycle_no"]) + 1
+                conn.execute(
+                    "UPDATE students SET status=?, cycle_no=? WHERE id=?",
+                    (STATUS_VU, new_cycle, student_id),
+                )
+                message = "Oublié : il repasse en Vu et recommence un cycle."
 
         elif student["status"] == STATUS_MEMORISE:
             if correct:
@@ -443,15 +511,15 @@ def record_answer(session_id: int, student_id: int, correct: bool, on_date: Opti
                     """,
                     (student_id, student["cycle_no"], today, _now()),
                 )
-                dates = memory_dates(conn, student_id, student["cycle_no"])
+                dates = memory_dates(conn, student_id, int(student["cycle_no"]))
                 if len(dates) >= 3:
                     conn.execute("UPDATE students SET status=? WHERE id=?", (STATUS_ACQUIS, student_id))
-                    message = "Acquis : mémorisé sur 3 jours différents."
+                    message = "Acquis 🎉 — mémorisé sur 3 jours différents."
                 else:
                     message = f"Mémorisé sur {len(dates)}/3 jour(s)."
                 completed = 1
             else:
-                new_cycle = student["cycle_no"] + 1
+                new_cycle = int(student["cycle_no"]) + 1
                 conn.execute(
                     "UPDATE students SET status=?, cycle_no=? WHERE id=?",
                     (STATUS_VU, new_cycle, student_id),
@@ -461,12 +529,9 @@ def record_answer(session_id: int, student_id: int, correct: bool, on_date: Opti
                     "UPDATE session_students SET correct_count=0 WHERE session_id=? AND student_id=?",
                     (session_id, student_id),
                 )
-                message = "Raté : retour à Vu et nouveau cycle de mémorisation."
+                message = "Raté : retour à Vu, nouveau cycle à zéro."
 
         else:
-            if student["status"] == STATUS_NON_COMMENCE:
-                conn.execute("UPDATE students SET status=? WHERE id=?", (STATUS_VU, student_id))
-
             if correct:
                 correct_count += 1
                 conn.execute(
@@ -474,21 +539,20 @@ def record_answer(session_id: int, student_id: int, correct: bool, on_date: Opti
                     (correct_count, session_id, student_id),
                 )
                 if correct_count >= 3:
-                    refreshed = conn.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
                     conn.execute(
                         """
                         INSERT OR IGNORE INTO memory_days(student_id, cycle_no, memory_date, created_at)
                         VALUES (?, ?, ?, ?)
                         """,
-                        (student_id, refreshed["cycle_no"], today, _now()),
+                        (student_id, student["cycle_no"], today, _now()),
                     )
                     conn.execute("UPDATE students SET status=? WHERE id=?", (STATUS_MEMORISE, student_id))
                     completed = 1
-                    message = "3 réussites : mémorisé pour aujourd'hui."
+                    message = "Mémorisé pour aujourd'hui ✅"
                 else:
-                    message = f"Bonne réponse : {correct_count}/3 aujourd'hui."
+                    message = f"Bonne réponse : {correct_count}/3 dans cette session."
             else:
-                message = f"Raté. Le compteur reste à {correct_count}/3 réussite(s)."
+                message = f"À revoir — {correct_count}/3 bonnes réponses pour l'instant."
 
         if completed:
             conn.execute(
@@ -496,23 +560,15 @@ def record_answer(session_id: int, student_id: int, correct: bool, on_date: Opti
                 (session_id, student_id),
             )
 
-        remaining = conn.execute(
-            "SELECT COUNT(*) AS n FROM session_students WHERE session_id=? AND completed=0",
-            (session_id,),
-        ).fetchone()["n"]
-        if remaining == 0:
-            conn.execute("UPDATE sessions SET completed_at=? WHERE id=?", (_now(), session_id))
-
         refreshed = conn.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
-        dates = memory_dates(conn, student_id, refreshed["cycle_no"])
+        dates = memory_dates(conn, student_id, int(refreshed["cycle_no"]))
+        finished = _finish_session_if_needed(conn, session_id)
         return {
-            "student_id": student_id,
             "status": refreshed["status"],
             "correct_count": correct_count,
-            "completed": bool(completed),
             "memory_dates": dates,
             "message": message,
-            "session_finished": remaining == 0,
+            "session_finished": finished,
         }
 
 
@@ -520,8 +576,7 @@ def session_progress(session_id: int) -> Dict[str, int]:
     with connect() as conn:
         row = conn.execute(
             """
-            SELECT COUNT(*) AS total,
-                   SUM(CASE WHEN completed=1 THEN 1 ELSE 0 END) AS completed
+            SELECT COUNT(*) AS total, SUM(completed) AS completed
             FROM session_students WHERE session_id=?
             """,
             (session_id,),
@@ -530,7 +585,11 @@ def session_progress(session_id: int) -> Dict[str, int]:
             "SELECT COUNT(*) AS n FROM attempts WHERE session_id=?",
             (session_id,),
         ).fetchone()["n"]
-    return {"total": row["total"] or 0, "completed": row["completed"] or 0, "attempts": attempts}
+        return {
+            "total": int(row["total"] or 0),
+            "completed": int(row["completed"] or 0),
+            "attempts": int(attempts or 0),
+        }
 
 
 def end_session(session_id: int) -> None:
@@ -539,3 +598,50 @@ def end_session(session_id: int) -> None:
             "UPDATE sessions SET completed_at=COALESCE(completed_at, ?) WHERE id=?",
             (_now(), session_id),
         )
+
+
+def create_backup_bytes() -> bytes:
+    init_db()
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in DATA_DIR.rglob("*"):
+            if path.is_file() and "backups" not in path.relative_to(DATA_DIR).parts:
+                archive.write(path, path.relative_to(DATA_DIR).as_posix())
+    return buffer.getvalue()
+
+
+def restore_backup_bytes(zip_bytes: bytes) -> None:
+    ensure_data_dirs()
+    parent = DATA_DIR.parent
+    with tempfile.TemporaryDirectory(prefix="flashtrombi-restore-", dir=parent) as temp_root:
+        temp_path = Path(temp_root) / "restored"
+        temp_path.mkdir()
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as archive:
+            members = archive.infolist()
+            for member in members:
+                target = (temp_path / member.filename).resolve()
+                if temp_path.resolve() not in target.parents and target != temp_path.resolve():
+                    raise ValueError("Sauvegarde invalide.")
+            archive.extractall(temp_path)
+
+        if not (temp_path / "flash_trombi.sqlite3").exists():
+            raise ValueError("Cette archive ne contient pas une sauvegarde Flash Trombi valide.")
+
+        old_path = parent / f"{DATA_DIR.name}.old"
+        if old_path.exists():
+            shutil.rmtree(old_path, ignore_errors=True)
+        if DATA_DIR.exists():
+            DATA_DIR.rename(old_path)
+        try:
+            shutil.copytree(temp_path, DATA_DIR)
+        except Exception:
+            if DATA_DIR.exists():
+                shutil.rmtree(DATA_DIR, ignore_errors=True)
+            if old_path.exists():
+                old_path.rename(DATA_DIR)
+            raise
+        finally:
+            if old_path.exists():
+                shutil.rmtree(old_path, ignore_errors=True)
+
+    init_db()

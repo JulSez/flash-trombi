@@ -7,7 +7,6 @@ import fitz
 
 
 def _portrait_blocks(page: fitz.Page) -> List[Dict]:
-    """Return the dominant repeated portrait-image family on a Pronote-like page."""
     page_dict = page.get_text("dict")
     images = []
     for block in page_dict.get("blocks", []):
@@ -24,8 +23,6 @@ def _portrait_blocks(page: fitz.Page) -> List[Dict]:
     if not images:
         return []
 
-    # Portraits are normally a repeated size. Use a tolerant family because
-    # placeholders / crops can be a few points shorter than regular portraits.
     def same_family(a: Dict, b: Dict) -> bool:
         ar, br = a["rect"], b["rect"]
         return (
@@ -51,11 +48,13 @@ def _group_rows(items: List[Dict]) -> List[List[Dict]]:
     for item in sorted(items, key=lambda it: (it["rect"].y0, it["rect"].x0)):
         cy = (item["rect"].y0 + item["rect"].y1) / 2
         target = None
+        best_delta = None
         for row in rows:
             row_cy = statistics.mean((it["rect"].y0 + it["rect"].y1) / 2 for it in row)
-            if abs(cy - row_cy) <= tolerance:
+            delta = abs(cy - row_cy)
+            if delta <= tolerance and (best_delta is None or delta < best_delta):
                 target = row
-                break
+                best_delta = delta
         if target is None:
             rows.append([item])
         else:
@@ -63,6 +62,7 @@ def _group_rows(items: List[Dict]) -> List[List[Dict]]:
 
     for row in rows:
         row.sort(key=lambda it: it["rect"].x0)
+    rows.sort(key=lambda row: statistics.mean(it["rect"].y0 for it in row))
     return rows
 
 
@@ -77,21 +77,19 @@ def _label_clip(page: fitz.Page, rows: List[List[Dict]], row_index: int, col_ind
     default_gap = statistics.median(gaps) if gaps else rect.width * 1.65
 
     if col_index > 0:
-        prev_cx = centers[col_index - 1]
-        left = (prev_cx + cx) / 2
+        left = (centers[col_index - 1] + cx) / 2
     else:
         left = cx - default_gap / 2
 
     if col_index + 1 < len(row):
-        next_cx = centers[col_index + 1]
-        right = (cx + next_cx) / 2
+        right = (cx + centers[col_index + 1]) / 2
     else:
         right = cx + default_gap / 2
 
     left = max(page.rect.x0, left)
     right = min(page.rect.x1, right)
-
     label_top = rect.y1 + 1.0
+
     if row_index + 1 < len(rows):
         next_top = min(it["rect"].y0 for it in rows[row_index + 1])
         label_bottom = min(next_top - 4.0, rect.y1 + 36.0)
@@ -105,12 +103,7 @@ def _label_clip(page: fitz.Page, rows: List[List[Dict]], row_index: int, col_ind
 
 
 def extract_cards(pdf_bytes: bytes) -> List[Dict]:
-    """Extract N portrait cards without assuming a fixed number or grid shape.
-
-    The portrait is taken from the PDF image block. The visual name label below
-    it is rendered separately, so the app can reveal the answer even if the
-    printed PDF rasterized the name and no text extraction is possible.
-    """
+    """Extract a variable number of portraits and their visual name labels."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     cards: List[Dict] = []
     global_index = 0
