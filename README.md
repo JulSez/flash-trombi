@@ -1,49 +1,74 @@
 # Flash Trombi
 
-Application Streamlit locale pour apprendre progressivement les noms d'une classe à partir d'un trombinoscope PDF.
+Application Windows d'apprentissage des noms d'élèves à partir d'un trombinoscope PDF.
 
-## Principe
+## Pour un utilisateur normal
 
-- 1 PDF importé = 1 classe nommée.
-- Les données sont stockées localement dans `data/` avec SQLite.
-- Les portraits et les petites étiquettes de nom sont extraits du PDF.
-- Une session travaille jusqu'à 10 élèves.
-- Priorité : **Mémorisé → Vu → Non commencé**.
-- Les **Acquis** ne reviennent qu'en entretien lorsque toute la classe est acquise.
-- Les 5 derniers élèves demandés sont évités lorsque le groupe est assez grand.
+Télécharger **FlashTrombi-Setup.exe** depuis la page Releases, l'installer, puis lancer **Flash Trombi** depuis le Bureau ou le menu Démarrer.
 
-## Cycle d'un élève
+Aucun Python, Git ou terminal n'est nécessaire.
 
-1. `Non commencé` → devient `Vu` lorsqu'il entre dans un groupe de travail.
-2. Un élève `Vu` doit être reconnu 3 fois dans la session pour devenir `Mémorisé [date]`.
-3. Un jour suivant, un élève `Mémorisé` est revu en priorité :
-   - bonne réponse → la nouvelle date est ajoutée ;
-   - mauvaise réponse → retour à `Vu` et démarrage d'un nouveau cycle.
-4. Après 3 dates différentes dans le même cycle → `Acquis`.
+### Premier lancement
 
-Les anciens cycles restent dans SQLite pour conserver l'historique, mais ils ne comptent plus après une remise à zéro.
+1. cliquer sur **Ajouter une classe** ;
+2. donner un nom à la classe ;
+3. choisir le PDF du trombinoscope ;
+4. vérifier les portraits détectés et décocher les mauvaises vignettes ;
+5. créer la classe ;
+6. cliquer sur **Continuer** pour commencer l'entraînement.
 
-## Installation Windows
+## Entraînement
 
-```powershell
-git clone https://github.com/JulSez/flash-trombi.git
-cd flash-trombi
+- séries de 10 élèves maximum ;
+- priorité : `Mémorisé → Vu → Non commencé` ;
+- les 5 derniers élèves demandés sont évités quand le groupe le permet ;
+- 3 bonnes réponses dans une série = mémorisé pour la date du jour ;
+- lors d'un jour suivant, un élève mémorisé est révisé en priorité ;
+- une réussite ajoute la nouvelle date ;
+- un échec remet l'élève en `Vu` et ouvre un nouveau cycle ;
+- 3 jours mémorisés dans le même cycle = `Acquis` ;
+- les acquis reviennent en entretien lorsque toute la classe est acquise ;
+- en entretien, un acquis oublié repasse en `Vu` et recommence un cycle.
+
+Le flux d'une carte est : **photo → afficher le nom → “Tu l'avais ?” → Oui / Non → carte suivante automatiquement**.
+
+## Données et confidentialité
+
+Sous Windows, les données sont stockées dans :
+
+```text
+%LOCALAPPDATA%\FlashTrombi\
+```
+
+On y trouve la base SQLite, les PDF et les portraits. Une mise à jour ou une réinstallation du programme n'efface pas ce dossier.
+
+L'application permet de télécharger une sauvegarde ZIP et de la restaurer. Ne jamais ajouter de vrais trombinoscopes ou données d'élèves au dépôt GitHub.
+
+## Développement
+
+```bash
+python -m venv .venv
+# Windows : .venv\Scripts\activate
+# macOS/Linux : source .venv/bin/activate
 python -m pip install -r requirements.txt
 python -m streamlit run app.py
 ```
 
-## Données locales
+Pour isoler les données de test :
 
-L'application crée automatiquement :
-
-```text
-data/
-├── flash_trombi.sqlite3
-└── classes/
-    └── 0001-Ma-classe/
-        ├── source.pdf
-        ├── portraits/
-        └── labels/
+```powershell
+$env:FLASH_TROMBI_DATA_DIR="$PWD\data-test"
+python -m streamlit run app.py
 ```
 
-Le dossier `data/` est ignoré par Git afin d'éviter d'envoyer des trombinoscopes ou des données d'élèves sur GitHub.
+## Construire l'installateur Windows
+
+Pré-requis développeur : Python et Inno Setup 6.
+
+```powershell
+.\build_windows.ps1
+```
+
+Le résultat est `installer-output\FlashTrombi-Setup.exe`.
+
+GitHub Actions peut également construire automatiquement l'installateur. Un tag comme `v0.3.0` crée un build Windows et attache l'installateur à la Release GitHub correspondante.

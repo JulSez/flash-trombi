@@ -1,14 +1,16 @@
 .venv/
-venv/
 __pycache__/
 *.py[cod]
-.env
 .DS_Store
-
-# Local data: PDFs, portraits, labels and SQLite progression database.
-data/
-
-# Student data must never be committed.
+.streamlit/secrets.toml
 *.pdf
 *.csv
 *.xlsx
+photos/
+images/
+data/
+exports/
+build/
+dist/
+installer-output/
+*.spec
