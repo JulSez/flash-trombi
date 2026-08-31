@@ -129,10 +129,18 @@ class LearningWorkflowTests(unittest.TestCase):
         ]
         self.assertEqual(0.5, mastery_ratio(students))
 
-    def test_pronote_name_split(self):
-        first, last = split_pronote_name("NDONG MBIDA Yannick Pharell")
-        self.assertEqual("Yannick Pharell", first)
-        self.assertEqual("Ndong Mbida", last)
+    def test_name_split_uses_visual_lines_for_compound_names(self):
+        first, last = split_pronote_name(
+            "DE LA TOUR Camille Anne",
+            ["DE LA TOUR", "Camille Anne"],
+        )
+        self.assertEqual("Camille Anne", first)
+        self.assertEqual("De La Tour", last)
+
+    def test_name_split_still_handles_single_line_labels(self):
+        first, last = split_pronote_name("DUPONT MARTIN Camille Anne")
+        self.assertEqual("Camille Anne", first)
+        self.assertEqual("Dupont Martin", last)
 
 
 if __name__ == "__main__":
