@@ -352,11 +352,11 @@ def page_add_class() -> None:
                     )
                 clear_analysis()
                 st.session_state[f"active_class_{class_id}"] = True
-                st.session_state["nav"] = NAV_HOME
+                st.session_state["pending_nav"] = NAV_HOME
                 st.session_state["welcome_message"] = "Classe créée."
                 st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
+            except Exception:
+                st.error("La classe n'a pas pu être créée. Réessaie une fois.")
     with b2:
         if st.button("↩️ Recommencer", use_container_width=True):
             clear_analysis()
@@ -692,6 +692,10 @@ def page_backup() -> None:
 
 
 def main() -> None:
+    pending_nav = st.session_state.pop("pending_nav", None)
+    if pending_nav in NAV_ITEMS:
+        st.session_state["nav"] = pending_nav
+
     if "nav" not in st.session_state:
         st.session_state["nav"] = NAV_HOME
 

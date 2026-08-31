@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+import hashlib
+import io
+import os
+import pickle
 import re
 import statistics
+import tempfile
+from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import fitz
+from PIL import Image, ImageDraw
 
 _OCR_ENGINE = None
 _OCR_UNAVAILABLE = False
+_IMPORT_CACHE_VERSION = "row-batch-v1"
+_FAST_ZOOM = 3.2
+_FALLBACK_SCALE = 1.45
 
 
 def _portrait_blocks(page: fitz.Page) -> List[Dict]:
@@ -85,13 +95,7 @@ def _row_label_band(page: fitz.Page, rows: List[List[Dict]], row_index: int) -> 
 
 
 def _cell_ranges(page: fitz.Page, row: List[Dict]) -> Tuple[List[float], List[Tuple[float, float]]]:
-    """Return one horizontal label cell per portrait.
-
-    Pronote starts each label at the same x coordinate as its portrait and
-    wraps long labels before the next portrait starts. Using those portrait
-    left edges as hard cell boundaries lets us crop each student's answer
-    before text recognition, so neighbouring names can never be merged first.
-    """
+    """Return one horizontal label cell per portrait."""
     anchors = [float(item["rect"].x0) for item in row]
     if not anchors:
         return [], []
@@ -109,10 +113,7 @@ def _cell_ranges(page: fitz.Page, row: List[Dict]) -> Tuple[List[float], List[Tu
     pitch = statistics.median(gaps)
     ranges: List[Tuple[float, float]] = []
     for index, left in enumerate(anchors):
-        if index + 1 < len(anchors):
-            right = anchors[index + 1]
-        else:
-            right = left + pitch
+        right = anchors[index + 1] if index + 1 < len(anchors) else left + pitch
         ranges.append(
             (
                 max(float(page.rect.x0), left),
@@ -145,7 +146,7 @@ def _assign_cell(
     anchors: Sequence[float],
     ranges: Sequence[Tuple[float, float]],
 ) -> int:
-    """Compatibility helper used by tests and older PDF layouts."""
+    """Assign a text fragment to the card whose left edge owns it."""
     if not anchors:
         return 0
 
@@ -194,14 +195,21 @@ def _group_fragments_into_lines(
     return lines
 
 
-def _pdf_lines_for_cell(page: fitz.Page, clip: fitz.Rect) -> List[str]:
-    fragments: List[Tuple[float, float, float, float, str]] = []
-    for word in page.get_text("words", clip=clip):
+def _pdf_lines_for_row(
+    page: fitz.Page,
+    band: fitz.Rect,
+    anchors: Sequence[float],
+    ranges: Sequence[Tuple[float, float]],
+) -> List[List[str]]:
+    grouped: List[List[Tuple[float, float, float, float, str]]] = [[] for _ in anchors]
+    for word in page.get_text("words", clip=band):
         x0, y0, x1, y1, text = word[:5]
         text = str(text).strip()
-        if text:
-            fragments.append((float(x0), float(y0), float(x1), float(y1), text))
-    return _group_fragments_into_lines(fragments)
+        if not text:
+            continue
+        idx = _assign_cell(float(x0), float(x1), anchors, ranges)
+        grouped[idx].append((float(x0), float(y0), float(x1), float(y1), text))
+    return [_group_fragments_into_lines(parts) for parts in grouped]
 
 
 def _get_ocr_engine():
@@ -220,52 +228,112 @@ def _get_ocr_engine():
         return None
 
 
-def _ocr_lines_for_cell(
-    page: fitz.Page,
-    clip: fitz.Rect,
-    zoom: float = 4.5,
-) -> List[str]:
-    """Read exactly one Pronote card label.
+def _image_to_png(image: Image.Image) -> bytes:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", optimize=False)
+    return buffer.getvalue()
 
-    The old implementation read a whole row first and then tried to split the
-    recognised boxes between students. On tight rows, the recogniser could
-    merge e.g. "MEGHERBI Ahmed" and "MEYER Romane" into one box before our code
-    got a chance to separate them. Cropping one cell first makes that merge
-    impossible.
-    """
+
+def _render_band_image(page: fitz.Page, band: fitz.Rect, zoom: float = _FAST_ZOOM) -> Image.Image:
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=band, alpha=False)
+    return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+
+
+def _cell_pixel_box(
+    band: fitz.Rect,
+    cell_range: Tuple[float, float],
+    zoom: float,
+    image: Image.Image,
+) -> Tuple[int, int, int, int]:
+    left, right = cell_range
+    x0 = max(0, min(image.width, int(round((left - band.x0) * zoom))))
+    x1 = max(x0 + 1, min(image.width, int(round((right - band.x0) * zoom))))
+    return x0, 0, x1, image.height
+
+
+def _crop_cell_image(
+    row_image: Image.Image,
+    band: fitz.Rect,
+    cell_range: Tuple[float, float],
+    zoom: float,
+) -> Image.Image:
+    return row_image.crop(_cell_pixel_box(band, cell_range, zoom, row_image))
+
+
+def _separated_row_image(
+    row_image: Image.Image,
+    band: fitz.Rect,
+    ranges: Sequence[Tuple[float, float]],
+    zoom: float,
+) -> Image.Image:
+    """Insert thin white gutters so the recogniser cannot merge neighbouring names."""
+    image = row_image.copy()
+    draw = ImageDraw.Draw(image)
+    half_width = max(2, int(round(1.2 * zoom)))
+    for left, _ in ranges[1:]:
+        x = int(round((left - band.x0) * zoom))
+        draw.rectangle((x - half_width, 0, x + half_width, image.height), fill="white")
+    return image
+
+
+def _ocr_fragments(image: Image.Image, *, min_score: float = 0.40):
     engine = _get_ocr_engine()
     if engine is None:
         return []
-
     try:
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
-        result = engine(pix.tobytes("png"))
+        result = engine(_image_to_png(image))
         txts = getattr(result, "txts", None)
         boxes = getattr(result, "boxes", None)
         scores = getattr(result, "scores", None)
         if txts is None or boxes is None:
             return []
 
-        fragments: List[Tuple[float, float, float, float, str]] = []
+        fragments = []
         for index, text in enumerate(txts):
             text = str(text).strip()
             if not text:
                 continue
-            if scores is not None and index < len(scores) and float(scores[index]) < 0.40:
+            if scores is not None and index < len(scores) and float(scores[index]) < min_score:
                 continue
-
             box = boxes[index]
             xs = [float(point[0]) for point in box]
             ys = [float(point[1]) for point in box]
-            x0 = clip.x0 + min(xs) / zoom
-            x1 = clip.x0 + max(xs) / zoom
-            y0 = clip.y0 + min(ys) / zoom
-            y1 = clip.y0 + max(ys) / zoom
-            fragments.append((x0, y0, x1, y1, text))
-
-        return _group_fragments_into_lines(fragments)
+            fragments.append((min(xs), min(ys), max(xs), max(ys), text))
+        return fragments
     except Exception:
         return []
+
+
+def _ocr_lines_for_row_image(
+    row_image: Image.Image,
+    band: fitz.Rect,
+    anchors: Sequence[float],
+    ranges: Sequence[Tuple[float, float]],
+    zoom: float = _FAST_ZOOM,
+) -> List[List[str]]:
+    grouped: List[List[Tuple[float, float, float, float, str]]] = [[] for _ in anchors]
+    prepared = _separated_row_image(row_image, band, ranges, zoom)
+    for px0, py0, px1, py1, text in _ocr_fragments(prepared):
+        x0 = band.x0 + px0 / zoom
+        x1 = band.x0 + px1 / zoom
+        y0 = band.y0 + py0 / zoom
+        y1 = band.y0 + py1 / zoom
+        idx = _assign_cell(x0, x1, anchors, ranges)
+        grouped[idx].append((x0, y0, x1, y1, text))
+    return [_group_fragments_into_lines(parts) for parts in grouped]
+
+
+def _ocr_lines_for_cell_image(cell_image: Image.Image) -> List[str]:
+    if cell_image.width < 2 or cell_image.height < 2:
+        return []
+    enlarged = cell_image.resize(
+        (
+            max(2, int(round(cell_image.width * _FALLBACK_SCALE))),
+            max(2, int(round(cell_image.height * _FALLBACK_SCALE))),
+        ),
+        Image.Resampling.LANCZOS,
+    )
+    return _group_fragments_into_lines(_ocr_fragments(enlarged))
 
 
 def _clean_name_line(value: str) -> str:
@@ -327,13 +395,7 @@ def _name_case(value: str) -> str:
 
 
 def split_pronote_name(value: str, lines: Sequence[str] | None = None) -> Tuple[str, str]:
-    """Return (first_name, last_name) from Pronote's SURNAME Firstname format.
-
-    Pronote wraps at the card boundary. The surname may span several visual
-    lines (RAMIREZ / ELIZALDE Brandon) and either surname or first name may be
-    hyphenated at a line break (MARCHAND- / TAVENAUX Sacha,
-    GRUMBERG John- / Alexandre).
-    """
+    """Return (first_name, last_name) from Pronote's SURNAME Firstname format."""
     cleaned_lines = _clean_lines(lines or [])
     tokens = _join_wrapped_tokens(cleaned_lines)
 
@@ -371,7 +433,60 @@ def _best_name_lines(pdf_lines: Sequence[str], ocr_lines: Sequence[str]) -> Tupl
     return [], ""
 
 
-def extract_cards(pdf_bytes: bytes) -> List[Dict]:
+def _looks_like_merged_label(lines: Sequence[str]) -> bool:
+    """Detect a likely second surname appearing after the first name has begun."""
+    tokens = _join_wrapped_tokens(lines)
+    started_first = False
+    for token in tokens:
+        if not started_first:
+            if not _is_upper_name_token(token):
+                started_first = True
+        elif _is_upper_name_token(token):
+            return True
+    return False
+
+
+def _needs_cell_fallback(lines: Sequence[str]) -> bool:
+    cleaned = _clean_lines(lines)
+    if not cleaned or _looks_like_merged_label(cleaned):
+        return True
+    name_text = _clean_name_text(_join_name_lines(cleaned))
+    first_name, last_name = split_pronote_name(name_text, cleaned)
+    return not bool(first_name and last_name)
+
+
+def _cache_path(pdf_bytes: bytes) -> Path:
+    override = os.environ.get("FLASH_TROMBI_IMPORT_CACHE_DIR")
+    root = Path(override) if override else Path(tempfile.gettempdir()) / "FlashTrombi-import-cache"
+    digest = hashlib.sha256(_IMPORT_CACHE_VERSION.encode("utf-8") + b"\0" + pdf_bytes).hexdigest()
+    return root / f"{digest}.pkl"
+
+
+def _load_cached_cards(pdf_bytes: bytes) -> List[Dict] | None:
+    path = _cache_path(pdf_bytes)
+    try:
+        with path.open("rb") as handle:
+            value = pickle.load(handle)
+        if isinstance(value, list):
+            return value
+    except Exception:
+        return None
+    return None
+
+
+def _save_cached_cards(pdf_bytes: bytes, cards: List[Dict]) -> None:
+    path = _cache_path(pdf_bytes)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(".tmp")
+        with temp_path.open("wb") as handle:
+            pickle.dump(cards, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        temp_path.replace(path)
+    except Exception:
+        return
+
+
+def _extract_cards_uncached(pdf_bytes: bytes) -> List[Dict]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     cards: List[Dict] = []
     global_index = 0
@@ -382,40 +497,44 @@ def extract_cards(pdf_bytes: bytes) -> List[Dict]:
 
         for row_index, row in enumerate(rows):
             band = _row_label_band(page, rows, row_index)
+            anchors, ranges = _cell_ranges(page, row)
+            pdf_by_cell = _pdf_lines_for_row(page, band, anchors, ranges)
+            row_image = _render_band_image(page, band, _FAST_ZOOM)
+
+            need_ocr = [not _clean_lines(lines) for lines in pdf_by_cell]
+            ocr_by_cell: List[List[str]] = [[] for _ in row]
+            if any(need_ocr):
+                ocr_by_cell = _ocr_lines_for_row_image(
+                    row_image,
+                    band,
+                    anchors,
+                    ranges,
+                    _FAST_ZOOM,
+                )
+
+            fallback_indices = [
+                index
+                for index, needed in enumerate(need_ocr)
+                if needed and _needs_cell_fallback(ocr_by_cell[index])
+            ]
+            for index in fallback_indices:
+                cell_image = _crop_cell_image(row_image, band, ranges[index], _FAST_ZOOM)
+                fallback = _ocr_lines_for_cell_image(cell_image)
+                if _clean_lines(fallback):
+                    ocr_by_cell[index] = fallback
 
             for col_index, item in enumerate(row):
                 global_index += 1
                 block = item["block"]
-
-                # Important: read each label in its own non-overlapping cell.
-                # This prevents a long label from being merged with the next one.
-                read_clip = _cell_label_clip(
-                    page,
-                    row,
-                    col_index,
-                    band,
-                    visual_margin=False,
-                )
-                pdf_lines = _pdf_lines_for_cell(page, read_clip)
-                ocr_lines: List[str] = []
-                if not _clean_lines(pdf_lines):
-                    ocr_lines = _ocr_lines_for_cell(page, read_clip)
-
-                lines, source = _best_name_lines(pdf_lines, ocr_lines)
+                lines, source = _best_name_lines(pdf_by_cell[col_index], ocr_by_cell[col_index])
                 name_text = _clean_name_text(_join_name_lines(lines))
                 first_name, last_name = split_pronote_name(name_text, lines)
 
-                visual_clip = _cell_label_clip(
-                    page,
-                    row,
-                    col_index,
+                label_image = _crop_cell_image(
+                    row_image,
                     band,
-                    visual_margin=True,
-                )
-                label_pix = page.get_pixmap(
-                    matrix=fitz.Matrix(3.5, 3.5),
-                    clip=visual_clip,
-                    alpha=False,
+                    ranges[col_index],
+                    _FAST_ZOOM,
                 )
 
                 cards.append(
@@ -425,7 +544,7 @@ def extract_cards(pdf_bytes: bytes) -> List[Dict]:
                         "position": global_index,
                         "photo_bytes": block["image"],
                         "photo_ext": block.get("ext", "jpg") or "jpg",
-                        "label_bytes": label_pix.tobytes("png"),
+                        "label_bytes": _image_to_png(label_image),
                         "name_text": name_text,
                         "first_name": first_name,
                         "last_name": last_name,
@@ -433,4 +552,13 @@ def extract_cards(pdf_bytes: bytes) -> List[Dict]:
                     }
                 )
 
+    return cards
+
+
+def extract_cards(pdf_bytes: bytes) -> List[Dict]:
+    cached = _load_cached_cards(pdf_bytes)
+    if cached is not None:
+        return cached
+    cards = _extract_cards_uncached(pdf_bytes)
+    _save_cached_cards(pdf_bytes, cards)
     return cards
