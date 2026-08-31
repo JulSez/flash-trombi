@@ -498,11 +498,6 @@ def _add_student_to_session(
         """,
         (session_id, int(student["id"]), str(student["status"])),
     )
-    if student["status"] == STATUS_NON_COMMENCE:
-        conn.execute(
-            "UPDATE students SET status=? WHERE id=?",
-            (STATUS_VU, int(student["id"])),
-        )
 
 
 def _replenish_session(
@@ -648,7 +643,24 @@ def next_student(session_id: int) -> Optional[Dict]:
             if pool:
                 candidates = pool
                 break
-        return _student_dict(conn, random.choice(candidates))
+
+        chosen = random.choice(candidates)
+        if chosen["status"] == STATUS_NON_COMMENCE:
+            conn.execute(
+                "UPDATE students SET status=? WHERE id=?",
+                (STATUS_VU, int(chosen["id"])),
+            )
+            chosen = conn.execute(
+                """
+                SELECT s.*, c.name AS class_name, ss.correct_count, ss.completed
+                FROM session_students ss
+                JOIN students s ON s.id=ss.student_id
+                JOIN classes c ON c.id=s.class_id
+                WHERE ss.session_id=? AND s.id=?
+                """,
+                (session_id, int(chosen["id"])),
+            ).fetchone()
+        return _student_dict(conn, chosen)
 
 
 def _finish_session_if_needed(conn: sqlite3.Connection, session_id: int) -> bool:

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import paths  # noqa: F401
 import pdf_import  # noqa: F401
+import practice_mode  # noqa: F401
 import progress_view  # noqa: F401
 import storage  # noqa: F401
 import updates  # noqa: F401
