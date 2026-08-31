@@ -142,6 +142,27 @@ class LearningWorkflowTests(unittest.TestCase):
         self.assertEqual("Camille Anne", first)
         self.assertEqual("Dupont Martin", last)
 
+    def test_name_split_keeps_hyphenated_first_name_across_lines(self):
+        first, last = split_pronote_name(
+            "GRUMBERG John Alexandre",
+            ["GRUMBERG John-", "Alexandre"],
+        )
+        self.assertEqual("John-Alexandre", first)
+        self.assertEqual("Grumberg", last)
+
+    def test_adjacent_examples_parse_independently(self):
+        first, last = split_pronote_name("MEGHERBI Ahmed", ["MEGHERBI Ahmed"])
+        self.assertEqual("Ahmed", first)
+        self.assertEqual("Megherbi", last)
+
+        first, last = split_pronote_name("MEYER Romane", ["MEYER Romane"])
+        self.assertEqual("Romane", first)
+        self.assertEqual("Meyer", last)
+
+        first, last = split_pronote_name("GUEDE Brielly", ["GUEDE Brielly"])
+        self.assertEqual("Brielly", first)
+        self.assertEqual("Guede", last)
+
 
 if __name__ == "__main__":
     unittest.main()
