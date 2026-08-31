@@ -41,12 +41,13 @@ def display_stage(student: dict, on_date: date | None = None) -> str:
 
 
 def mastery_points(student: dict) -> int:
+    """Internal score used only to draw the class progress bar."""
     status = str(student.get("status", "non_commence"))
     if status == "acquis":
-        return 4
+        return 6
     if status == "memorise":
         dates = list(student.get("memory_dates") or [])
-        return 3 if len(dates) >= 2 else 2
+        return 4 if len(dates) >= 2 else 2
     if status == "vu":
         return 1
     return 0
@@ -64,4 +65,4 @@ def mastery_ratio(students: Iterable[dict]) -> float:
     items = list(students)
     if not items:
         return 0.0
-    return sum(mastery_points(student) for student in items) / (len(items) * 4)
+    return sum(mastery_points(student) for student in items) / (len(items) * 6)
