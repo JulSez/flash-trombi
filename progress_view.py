@@ -40,17 +40,22 @@ def display_stage(student: dict, on_date: date | None = None) -> str:
     return STAGE_NEW
 
 
-def mastery_points(student: dict) -> int:
-    """Internal score used only to draw the class progress bar."""
+def mastery_points(student: dict) -> float:
+    """Return the visible mastery contribution for one student.
+
+    The bar follows the real three-day memorisation path: one memorisation day
+    is roughly one third, two days roughly two thirds, and acquisition is full.
+    Seeing a student once remains a smaller first step.
+    """
     status = str(student.get("status", "non_commence"))
     if status == "acquis":
-        return 6
+        return 1.0
     if status == "memorise":
         dates = list(student.get("memory_dates") or [])
-        return 4 if len(dates) >= 2 else 2
+        return 2.0 / 3.0 if len(dates) >= 2 else 1.0 / 3.0
     if status == "vu":
-        return 1
-    return 0
+        return 0.25
+    return 0.0
 
 
 def stage_counts(students: Iterable[dict], on_date: date | None = None) -> dict[str, int]:
@@ -65,4 +70,4 @@ def mastery_ratio(students: Iterable[dict]) -> float:
     items = list(students)
     if not items:
         return 0.0
-    return sum(mastery_points(student) for student in items) / (len(items) * 6)
+    return sum(mastery_points(student) for student in items) / len(items)

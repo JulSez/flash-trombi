@@ -714,14 +714,22 @@ def next_student(session_id: int) -> Optional[Dict]:
                 break
 
         chosen = random.choice(candidates)
-        item = _student_dict(conn, chosen)
-        if str(chosen["status"]) == STATUS_NON_COMMENCE:
+        if chosen["status"] == STATUS_NON_COMMENCE:
             conn.execute(
                 "UPDATE students SET status=? WHERE id=?",
                 (STATUS_VU, int(chosen["id"])),
             )
-            item["status"] = STATUS_VU
-        return item
+            chosen = conn.execute(
+                """
+                SELECT s.*, c.name AS class_name, ss.correct_count, ss.completed
+                FROM session_students ss
+                JOIN students s ON s.id=ss.student_id
+                JOIN classes c ON c.id=s.class_id
+                WHERE ss.session_id=? AND s.id=?
+                """,
+                (session_id, int(chosen["id"])),
+            ).fetchone()
+        return _student_dict(conn, chosen)
 
 
 def _finish_session_if_needed(conn: sqlite3.Connection, session_id: int) -> bool:
