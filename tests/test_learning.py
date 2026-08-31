@@ -20,6 +20,15 @@ from storage import (  # noqa: E402
     start_or_resume_session,
 )
 from pdf_import import split_pronote_name  # noqa: E402
+from progress_view import (  # noqa: E402
+    STAGE_ACQUIRED,
+    STAGE_MEMORISED,
+    STAGE_NEW,
+    STAGE_REVIEW,
+    STAGE_SEEN,
+    display_stage,
+    mastery_ratio,
+)
 
 
 def cards(names: list[tuple[str, str]]):
@@ -101,6 +110,24 @@ class LearningWorkflowTests(unittest.TestCase):
         self.assertEqual(STATUS_VU, result["status"])
         self.assertEqual([], refreshed["memory_dates"])
         self.assertEqual(2, refreshed["cycle_no"])
+
+    def test_display_stages_include_review_day(self):
+        self.assertEqual(STAGE_NEW, display_stage({"status": "non_commence"}, date(2026, 4, 1)))
+        self.assertEqual(STAGE_SEEN, display_stage({"status": "vu"}, date(2026, 4, 1)))
+        memorised = {"status": "memorise", "memory_dates": ["2026-04-01"]}
+        self.assertEqual(STAGE_MEMORISED, display_stage(memorised, date(2026, 4, 1)))
+        self.assertEqual(STAGE_REVIEW, display_stage(memorised, date(2026, 4, 2)))
+        self.assertEqual(STAGE_ACQUIRED, display_stage({"status": "acquis"}, date(2026, 4, 2)))
+
+    def test_mastery_ratio_grows_with_progress(self):
+        students = [
+            {"status": "non_commence", "memory_dates": []},
+            {"status": "vu", "memory_dates": []},
+            {"status": "memorise", "memory_dates": ["2026-04-01"]},
+            {"status": "memorise", "memory_dates": ["2026-04-01", "2026-04-02"]},
+            {"status": "acquis", "memory_dates": ["2026-04-01", "2026-04-02", "2026-04-03"]},
+        ]
+        self.assertEqual(0.5, mastery_ratio(students))
 
     def test_pronote_name_split(self):
         first, last = split_pronote_name("NDONG MBIDA Yannick Pharell")
