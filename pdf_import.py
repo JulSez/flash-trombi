@@ -85,30 +85,41 @@ def _row_label_band(page: fitz.Page, rows: List[List[Dict]], row_index: int) -> 
 
 
 def _cell_ranges(page: fitz.Page, row: List[Dict]) -> Tuple[List[float], List[Tuple[float, float]]]:
-    centers = [(item["rect"].x0 + item["rect"].x1) / 2 for item in row]
-    if len(centers) == 1:
-        width = max(row[0]["rect"].width * 1.9, 100.0)
-        return centers, [
+    """Return label ownership ranges anchored on portrait left edges.
+
+    Pronote labels can be wider than the portrait and overflow to the right,
+    while their left edge stays aligned with the portrait. Midpoint-based cells
+    therefore cut long names too early. A card owns the horizontal space from
+    its portrait's left edge up to the next portrait's left edge.
+    """
+    anchors = [float(item["rect"].x0) for item in row]
+    if not anchors:
+        return [], []
+
+    if len(anchors) == 1:
+        width = max(float(row[0]["rect"].width) * 2.2, 120.0)
+        return anchors, [
             (
-                max(page.rect.x0, centers[0] - width / 2),
-                min(page.rect.x1, centers[0] + width / 2),
+                max(float(page.rect.x0), anchors[0]),
+                min(float(page.rect.x1), anchors[0] + width),
             )
         ]
 
-    gaps = [b - a for a, b in zip(centers, centers[1:])]
+    gaps = [right - left for left, right in zip(anchors, anchors[1:])]
     pitch = statistics.median(gaps)
     ranges: List[Tuple[float, float]] = []
-    for index, center in enumerate(centers):
-        if index == 0:
-            left = center - pitch / 2
+    for index, left in enumerate(anchors):
+        if index + 1 < len(anchors):
+            right = anchors[index + 1]
         else:
-            left = (centers[index - 1] + center) / 2
-        if index == len(centers) - 1:
-            right = center + pitch / 2
-        else:
-            right = (center + centers[index + 1]) / 2
-        ranges.append((max(page.rect.x0, left), min(page.rect.x1, right)))
-    return centers, ranges
+            right = left + pitch
+        ranges.append(
+            (
+                max(float(page.rect.x0), left),
+                min(float(page.rect.x1), right),
+            )
+        )
+    return anchors, ranges
 
 
 def _cell_label_clip(
@@ -119,31 +130,36 @@ def _cell_label_clip(
 ) -> fitz.Rect:
     _, ranges = _cell_ranges(page, row)
     left, right = ranges[col_index]
-    # A small margin gives the visual fallback room without reaching the next card.
-    margin = min(5.0, max(0.0, (right - left) * 0.035))
-    return fitz.Rect(
-        max(page.rect.x0, left - margin),
-        band.y0,
-        min(page.rect.x1, right + margin),
-        band.y1,
-    )
+    return fitz.Rect(left, band.y0, right, band.y1)
 
 
-def _nearest_index(value: float, centers: Sequence[float]) -> int:
-    return min(range(len(centers)), key=lambda idx: abs(centers[idx] - value))
+def _nearest_index(value: float, anchors: Sequence[float]) -> int:
+    return min(range(len(anchors)), key=lambda idx: abs(anchors[idx] - value))
 
 
 def _assign_cell(
     x0: float,
     x1: float,
-    centers: Sequence[float],
+    anchors: Sequence[float],
     ranges: Sequence[Tuple[float, float]],
 ) -> int:
-    overlaps = [max(0.0, min(x1, right) - max(x0, left)) for left, right in ranges]
-    best = max(overlaps) if overlaps else 0.0
-    if best > 0:
-        return overlaps.index(best)
-    return _nearest_index((x0 + x1) / 2, centers)
+    """Assign text using its left edge, not its centre or total width.
+
+    A long name may extend far into the space on its right. Its left edge still
+    identifies the portrait it belongs to. A tiny snap tolerance handles OCR
+    boxes that begin a couple of pixels before the visible portrait edge.
+    """
+    if not anchors:
+        return 0
+
+    nearest = _nearest_index(x0, anchors)
+    if abs(float(x0) - float(anchors[nearest])) <= 3.0:
+        return nearest
+
+    for index in range(len(anchors) - 1, -1, -1):
+        if float(x0) >= float(anchors[index]):
+            return index
+    return 0
 
 
 def _group_fragments_into_lines(
@@ -184,16 +200,16 @@ def _group_fragments_into_lines(
 def _pdf_lines_for_row(
     page: fitz.Page,
     band: fitz.Rect,
-    centers: Sequence[float],
+    anchors: Sequence[float],
     ranges: Sequence[Tuple[float, float]],
 ) -> List[List[str]]:
-    grouped: List[List[Tuple[float, float, float, float, str]]] = [[] for _ in centers]
+    grouped: List[List[Tuple[float, float, float, float, str]]] = [[] for _ in anchors]
     for word in page.get_text("words", clip=band):
         x0, y0, x1, y1, text = word[:5]
         text = str(text).strip()
         if not text:
             continue
-        idx = _assign_cell(float(x0), float(x1), centers, ranges)
+        idx = _assign_cell(float(x0), float(x1), anchors, ranges)
         grouped[idx].append((float(x0), float(y0), float(x1), float(y1), text))
 
     return [_group_fragments_into_lines(parts) for parts in grouped]
@@ -218,13 +234,13 @@ def _get_ocr_engine():
 def _ocr_lines_for_row(
     page: fitz.Page,
     band: fitz.Rect,
-    centers: Sequence[float],
+    anchors: Sequence[float],
     ranges: Sequence[Tuple[float, float]],
     zoom: float = 4.5,
 ) -> List[List[str]]:
     engine = _get_ocr_engine()
     if engine is None:
-        return [[] for _ in centers]
+        return [[] for _ in anchors]
 
     try:
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=band, alpha=False)
@@ -233,9 +249,9 @@ def _ocr_lines_for_row(
         boxes = getattr(result, "boxes", None)
         scores = getattr(result, "scores", None)
         if txts is None or boxes is None:
-            return [[] for _ in centers]
+            return [[] for _ in anchors]
 
-        grouped: List[List[Tuple[float, float, float, float, str]]] = [[] for _ in centers]
+        grouped: List[List[Tuple[float, float, float, float, str]]] = [[] for _ in anchors]
         for index, text in enumerate(txts):
             text = str(text).strip()
             if not text:
@@ -250,12 +266,12 @@ def _ocr_lines_for_row(
             x1 = band.x0 + max(xs) / zoom
             y0 = band.y0 + min(ys) / zoom
             y1 = band.y0 + max(ys) / zoom
-            idx = _assign_cell(x0, x1, centers, ranges)
+            idx = _assign_cell(x0, x1, anchors, ranges)
             grouped[idx].append((x0, y0, x1, y1, text))
 
         return [_group_fragments_into_lines(parts) for parts in grouped]
     except Exception:
-        return [[] for _ in centers]
+        return [[] for _ in anchors]
 
 
 def _clean_name_text(value: str) -> str:
@@ -281,10 +297,6 @@ def split_pronote_name(value: str, lines: Sequence[str] | None = None) -> Tuple[
     """Return (first_name, last_name) while preserving Pronote label structure."""
     cleaned_lines = _clean_lines(lines or [])
 
-    # On printed trombinoscopes Pronote commonly places the family name on the
-    # first visual line and the given name(s) below. Keeping that line break is
-    # much more reliable than guessing from word count, especially for compound
-    # family names or multiple given names.
     if len(cleaned_lines) >= 2:
         top_tokens = cleaned_lines[0].split()
         if top_tokens and all(_is_upper_name_token(token) for token in top_tokens):
@@ -311,8 +323,6 @@ def split_pronote_name(value: str, lines: Sequence[str] | None = None) -> Tuple[
     if surname and first:
         return _name_case(" ".join(first)), _name_case(" ".join(surname))
 
-    # With no reliable case or line break, avoid inventing a compound surname.
-    # The first token remains the safest fallback and is editable in the UI.
     if len(tokens) >= 2:
         return _name_case(" ".join(tokens[1:])), _name_case(tokens[0])
     return "", _name_case(tokens[0])
@@ -339,12 +349,12 @@ def extract_cards(pdf_bytes: bytes) -> List[Dict]:
 
         for row_index, row in enumerate(rows):
             band = _row_label_band(page, rows, row_index)
-            centers, ranges = _cell_ranges(page, row)
-            pdf_lines = _pdf_lines_for_row(page, band, centers, ranges)
+            anchors, ranges = _cell_ranges(page, row)
+            pdf_lines = _pdf_lines_for_row(page, band, anchors, ranges)
             need_ocr = [not _clean_lines(lines) for lines in pdf_lines]
             ocr_lines = [[] for _ in row]
             if any(need_ocr):
-                ocr_lines = _ocr_lines_for_row(page, band, centers, ranges)
+                ocr_lines = _ocr_lines_for_row(page, band, anchors, ranges)
 
             for col_index, item in enumerate(row):
                 global_index += 1

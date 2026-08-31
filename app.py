@@ -5,6 +5,12 @@ from pathlib import Path
 
 import streamlit as st
 
+from practice_mode import (
+    answer_practice,
+    create_practice_session,
+    current_practice_student,
+    only_memorised_remain,
+)
 from progress_view import STAGE_LABELS, STAGE_ORDER, display_stage, mastery_ratio, stage_counts
 from storage import (
     analyze_pdf,
@@ -80,19 +86,43 @@ def go_training(class_id: int) -> None:
     st.session_state[f"active_class_{class_id}"] = True
     st.session_state["nav"] = NAV_TRAIN
     st.session_state.pop("session_id", None)
+    st.session_state.pop("practice_session", None)
     st.session_state.pop("current_student", None)
     st.session_state.pop("answer_revealed", None)
     st.session_state.pop("feedback", None)
+
+
+def selected_students(class_ids: list[int]) -> list[dict]:
+    selected: list[dict] = []
+    for class_id in class_ids:
+        selected.extend(get_students(class_id))
+    return selected
+
+
+def _start_memorised_practice(class_ids: list[int], students: list[dict]) -> bool:
+    if not only_memorised_remain(students):
+        return False
+    practice = create_practice_session(class_ids, students, limit=10)
+    st.session_state["practice_session"] = practice
+    st.session_state.pop("session_id", None)
+    st.session_state.pop("current_student", None)
+    st.session_state["answer_revealed"] = False
+    st.session_state.pop("feedback", None)
+    return True
 
 
 def start_training(class_ids: list[int]) -> None:
     try:
         session = start_or_resume_session(class_ids)
         st.session_state["session_id"] = session["id"]
+        st.session_state.pop("practice_session", None)
         st.session_state.pop("current_student", None)
         st.session_state["answer_revealed"] = False
         st.session_state.pop("feedback", None)
     except Exception as exc:
+        students = selected_students(class_ids)
+        if "Rien à travailler aujourd'hui" in str(exc) and _start_memorised_practice(class_ids, students):
+            return
         st.session_state["friendly_error"] = str(exc)
 
 
@@ -121,6 +151,22 @@ def answer_current(correct: bool) -> None:
         st.session_state["friendly_error"] = str(exc)
 
 
+def answer_practice_current(correct: bool) -> None:
+    practice = st.session_state.get("practice_session")
+    if not practice:
+        return
+    result = answer_practice(practice, correct)
+    st.session_state["practice_session"] = practice
+    st.session_state["feedback"] = result["message"]
+    st.session_state["answer_revealed"] = False
+
+
+def stop_practice() -> None:
+    st.session_state.pop("practice_session", None)
+    st.session_state.pop("answer_revealed", None)
+    st.session_state.pop("feedback", None)
+
+
 def choose_random_student(class_ids: list[int]) -> None:
     recent = list(st.session_state.get("random_recent", []))[-5:]
     student = random_student(class_ids, recent)
@@ -140,11 +186,14 @@ def clear_analysis() -> None:
             st.session_state.pop(key, None)
 
 
-def selected_students(class_ids: list[int]) -> list[dict]:
-    selected: list[dict] = []
-    for class_id in class_ids:
-        selected.extend(get_students(class_id))
-    return selected
+def delete_class_and_go_home(class_id: int) -> None:
+    delete_class(class_id)
+    st.session_state.pop(f"active_class_{class_id}", None)
+    st.session_state.pop("session_id", None)
+    st.session_state.pop("practice_session", None)
+    st.session_state.pop("current_student", None)
+    st.session_state.pop("answer_revealed", None)
+    st.session_state["nav"] = NAV_HOME
 
 
 def active_class_selector(classes: list[dict]) -> list[int]:
@@ -314,6 +363,83 @@ def page_add_class() -> None:
             st.rerun()
 
 
+def render_practice(active_ids: list[int]) -> bool:
+    practice = st.session_state.get("practice_session")
+    if not practice:
+        return False
+
+    if sorted(practice.get("class_ids", [])) != sorted(active_ids):
+        stop_practice()
+        return False
+
+    feedback = st.session_state.pop("feedback", None)
+    if feedback:
+        st.toast(feedback)
+
+    if practice.get("completed"):
+        st.success("Série terminée 🎉")
+        st.caption("Les ratés ont été revus à la fin.")
+        st.button(
+            "▶️ Refaire une série",
+            type="primary",
+            use_container_width=True,
+            on_click=start_training,
+            args=(list(active_ids),),
+        )
+        return True
+
+    student = current_practice_student(practice)
+    if not student:
+        practice["completed"] = True
+        st.session_state["practice_session"] = practice
+        st.rerun()
+
+    if practice.get("phase") == "first":
+        question_no = min(int(practice.get("first_done", 0)) + 1, int(practice.get("first_total", 1)))
+        st.caption(f"Révision express · question {question_no}/{practice['first_total']}")
+    else:
+        st.caption("Retour sur les ratés")
+
+    left, right = st.columns([1.05, 1])
+    with left:
+        st.image(student["photo_path"], caption="Qui est cet élève ?", width=420)
+        st.caption(f"{student.get('class_name', '')} · Mémorisé")
+
+    with right:
+        if not st.session_state.get("answer_revealed", False):
+            st.markdown("## Donne son nom")
+            st.button(
+                "👀 Afficher le nom",
+                type="primary",
+                use_container_width=True,
+                on_click=reveal_answer,
+                key="practice_reveal",
+            )
+        else:
+            st.markdown("## Réponse")
+            show_answer(student)
+            st.markdown("### Tu l'avais ?")
+            yes, no = st.columns(2)
+            yes.button(
+                "✅ Oui",
+                type="primary",
+                use_container_width=True,
+                on_click=answer_practice_current,
+                args=(True,),
+                key="practice_yes",
+            )
+            no.button(
+                "❌ Non",
+                use_container_width=True,
+                on_click=answer_practice_current,
+                args=(False,),
+                key="practice_no",
+            )
+
+    st.button("⏹️ Arrêter", on_click=stop_practice, key="stop_practice")
+    return True
+
+
 def page_training(classes: list[dict], active_ids: list[int]) -> None:
     st.title("🎓 Entraînement")
     if not classes:
@@ -326,6 +452,9 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
     active_names = [row["name"] for row in classes if int(row["id"]) in active_ids]
     st.caption(" · ".join(active_names))
     status_metrics(selected_students(active_ids))
+
+    if render_practice(active_ids):
+        return
 
     session_id = st.session_state.get("session_id")
     session = get_session(session_id) if session_id else None
@@ -507,17 +636,14 @@ def page_manage(classes: list[dict]) -> None:
             f"Pour confirmer, écris exactement : {class_row['name']}",
             key=f"delete_confirm_{class_id}",
         )
-        if st.button(
+        st.button(
             "Supprimer définitivement",
             disabled=typed != class_row["name"],
             type="primary",
             key=f"delete_{class_id}",
-        ):
-            delete_class(class_id)
-            st.session_state.pop(f"active_class_{class_id}", None)
-            st.session_state.pop("session_id", None)
-            st.session_state["nav"] = NAV_HOME
-            st.rerun()
+            on_click=delete_class_and_go_home,
+            args=(class_id,),
+        )
 
 
 def page_backup() -> None:
