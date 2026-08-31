@@ -119,15 +119,16 @@ class LearningWorkflowTests(unittest.TestCase):
         self.assertEqual(STAGE_REVIEW, display_stage(memorised, date(2026, 4, 2)))
         self.assertEqual(STAGE_ACQUIRED, display_stage({"status": "acquis"}, date(2026, 4, 2)))
 
-    def test_mastery_ratio_grows_with_progress(self):
-        students = [
-            {"status": "non_commence", "memory_dates": []},
-            {"status": "vu", "memory_dates": []},
-            {"status": "memorise", "memory_dates": ["2026-04-01"]},
-            {"status": "memorise", "memory_dates": ["2026-04-01", "2026-04-02"]},
-            {"status": "acquis", "memory_dates": ["2026-04-01", "2026-04-02", "2026-04-03"]},
-        ]
-        self.assertEqual(0.5, mastery_ratio(students))
+    def test_mastery_ratio_tracks_three_memorisation_days(self):
+        one_day = [{"status": "memorise", "memory_dates": ["2026-04-01"]}]
+        two_days = [{"status": "memorise", "memory_dates": ["2026-04-01", "2026-04-02"]}]
+        acquired = [{"status": "acquis", "memory_dates": ["2026-04-01", "2026-04-02", "2026-04-03"]}]
+        self.assertAlmostEqual(1 / 3, mastery_ratio(one_day))
+        self.assertAlmostEqual(2 / 3, mastery_ratio(two_days))
+        self.assertEqual(1.0, mastery_ratio(acquired))
+
+    def test_seen_is_a_smaller_first_step(self):
+        self.assertEqual(0.25, mastery_ratio([{"status": "vu", "memory_dates": []}]))
 
     def test_name_split_uses_visual_lines_for_compound_names(self):
         first, last = split_pronote_name(
