@@ -16,6 +16,7 @@ from storage import (  # noqa: E402
     create_class_from_cards,
     get_session_students,
     get_students,
+    next_student,
     record_answer,
     start_or_resume_session,
 )
@@ -46,6 +47,17 @@ def cards(names: list[tuple[str, str]]):
         }
         for i, (first, last) in enumerate(names, start=1)
     ]
+
+
+def memorise_everyone_today(class_id: int, day: date) -> None:
+    session = start_or_resume_session(class_id, day)
+    while True:
+        active = [s for s in get_session_students(session["id"]) if not s["completed"]]
+        if not active:
+            return
+        for student in active:
+            for _ in range(3):
+                record_answer(session["id"], student["id"], True, day)
 
 
 class LearningWorkflowTests(unittest.TestCase):
@@ -111,6 +123,63 @@ class LearningWorkflowTests(unittest.TestCase):
         self.assertEqual([], refreshed["memory_dates"])
         self.assertEqual(2, refreshed["cycle_no"])
 
+    def test_memorised_only_session_uses_ten_and_retries_misses_at_end(self):
+        class_id = create_class_from_cards(
+            "MEM-ONLY",
+            b"fake-pdf",
+            cards([(f"Prenom{i:02d}", f"Nom{i:02d}") for i in range(1, 13)]),
+        )
+        day = date(2026, 5, 1)
+        memorise_everyone_today(class_id, day)
+
+        session = start_or_resume_session(class_id, day)
+        self.assertEqual(1, int(session["memorised_review_mode"]))
+        group = get_session_students(session["id"])
+        self.assertEqual(10, len(group))
+
+        missed = next_student(session["id"])
+        result = record_answer(session["id"], missed["id"], False, day)
+        self.assertFalse(result["session_finished"])
+
+        refreshed_group = get_session_students(session["id"])
+        missed_row = next(s for s in refreshed_group if s["id"] == missed["id"])
+        self.assertEqual(1, missed_row["review_first_done"])
+        self.assertEqual(1, missed_row["review_failed"])
+        self.assertEqual(0, missed_row["completed"])
+
+        while True:
+            remaining_first_pass = [
+                s
+                for s in get_session_students(session["id"])
+                if not s["completed"] and not s["review_first_done"]
+            ]
+            if not remaining_first_pass:
+                break
+            record_answer(session["id"], remaining_first_pass[0]["id"], True, day)
+
+        retry = next_student(session["id"])
+        self.assertEqual(missed["id"], retry["id"])
+        result = record_answer(session["id"], retry["id"], True, day)
+        self.assertTrue(result["session_finished"])
+        self.assertEqual(STATUS_MEMORISE, get_students(class_id)[missed["position"] - 1]["status"])
+
+    def test_second_miss_in_memorised_only_review_restarts_cycle(self):
+        class_id = create_class_from_cards("MEM-FAIL", b"fake-pdf", cards([("Jean", "Test")]))
+        day = date(2026, 5, 2)
+        memorise_everyone_today(class_id, day)
+        session = start_or_resume_session(class_id, day)
+
+        student = next_student(session["id"])
+        record_answer(session["id"], student["id"], False, day)
+        retry = next_student(session["id"])
+        result = record_answer(session["id"], retry["id"], False, day)
+
+        refreshed = get_students(class_id)[0]
+        self.assertTrue(result["session_finished"])
+        self.assertEqual(STATUS_VU, refreshed["status"])
+        self.assertEqual(2, refreshed["cycle_no"])
+        self.assertEqual([], refreshed["memory_dates"])
+
     def test_display_stages_include_review_day(self):
         self.assertEqual(STAGE_NEW, display_stage({"status": "non_commence"}, date(2026, 4, 1)))
         self.assertEqual(STAGE_SEEN, display_stage({"status": "vu"}, date(2026, 4, 1)))
@@ -119,7 +188,14 @@ class LearningWorkflowTests(unittest.TestCase):
         self.assertEqual(STAGE_REVIEW, display_stage(memorised, date(2026, 4, 2)))
         self.assertEqual(STAGE_ACQUIRED, display_stage({"status": "acquis"}, date(2026, 4, 2)))
 
-    def test_mastery_ratio_grows_with_progress(self):
+    def test_mastery_ratio_tracks_three_memory_days(self):
+        one_day = [{"status": "memorise", "memory_dates": ["2026-04-01"]}]
+        two_days = [
+            {"status": "memorise", "memory_dates": ["2026-04-01", "2026-04-02"]}
+        ]
+        self.assertAlmostEqual(1 / 3, mastery_ratio(one_day))
+        self.assertAlmostEqual(2 / 3, mastery_ratio(two_days))
+
         students = [
             {"status": "non_commence", "memory_dates": []},
             {"status": "vu", "memory_dates": []},
@@ -127,7 +203,7 @@ class LearningWorkflowTests(unittest.TestCase):
             {"status": "memorise", "memory_dates": ["2026-04-01", "2026-04-02"]},
             {"status": "acquis", "memory_dates": ["2026-04-01", "2026-04-02", "2026-04-03"]},
         ]
-        self.assertEqual(0.5, mastery_ratio(students))
+        self.assertAlmostEqual(13 / 30, mastery_ratio(students))
 
     def test_name_split_uses_visual_lines_for_compound_names(self):
         first, last = split_pronote_name(
