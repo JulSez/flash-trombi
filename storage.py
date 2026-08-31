@@ -10,7 +10,7 @@ import zipfile
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from paths import CLASSES_DIR, DATA_DIR, DB_PATH, ensure_data_dirs
 from pdf_import import extract_cards
@@ -59,6 +59,25 @@ def resolve_data_path(value: str) -> Path:
     return DATA_DIR / path
 
 
+def _normalize_class_ids(class_ids: int | Sequence[int]) -> List[int]:
+    if isinstance(class_ids, int):
+        values = [class_ids]
+    else:
+        values = [int(value) for value in class_ids]
+    return list(dict.fromkeys(values))
+
+
+def _scope_key(class_ids: int | Sequence[int]) -> str:
+    return ",".join(str(value) for value in sorted(_normalize_class_ids(class_ids)))
+
+
+def _parse_scope(session: sqlite3.Row | Dict) -> List[int]:
+    scope = str(session["class_scope"] or "").strip() if "class_scope" in session.keys() else ""
+    if scope:
+        return [int(part) for part in scope.split(",") if part.strip()]
+    return [int(session["class_id"])]
+
+
 @contextmanager
 def connect():
     ensure_data_dirs()
@@ -73,6 +92,12 @@ def connect():
         raise
     finally:
         conn.close()
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, name: str, definition: str) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if name not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def init_db() -> None:
@@ -140,6 +165,8 @@ def init_db() -> None:
             );
             """
         )
+        _ensure_column(conn, "students", "name_source", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "sessions", "class_scope", "TEXT NOT NULL DEFAULT ''")
 
 
 def class_name_exists(name: str) -> bool:
@@ -154,8 +181,7 @@ def analyze_pdf(pdf_bytes: bytes) -> List[Dict]:
 
 
 def create_class(name: str, pdf_bytes: bytes) -> int:
-    cards = analyze_pdf(pdf_bytes)
-    return create_class_from_cards(name, pdf_bytes, cards)
+    return create_class_from_cards(name, pdf_bytes, analyze_pdf(pdf_bytes))
 
 
 def create_class_from_cards(name: str, pdf_bytes: bytes, cards: Sequence[Dict]) -> int:
@@ -170,10 +196,7 @@ def create_class_from_cards(name: str, pdf_bytes: bytes, cards: Sequence[Dict]) 
     folder: Optional[Path] = None
     try:
         with connect() as conn:
-            cursor = conn.execute(
-                "INSERT INTO classes(name, created_at) VALUES (?, ?)",
-                (name, _now()),
-            )
+            cursor = conn.execute("INSERT INTO classes(name, created_at) VALUES (?, ?)", (name, _now()))
             class_id = int(cursor.lastrowid)
             folder = CLASSES_DIR / f"{class_id:04d}-{_slugify(name)}"
             portraits_dir = folder / "portraits"
@@ -199,20 +222,25 @@ def create_class_from_cards(name: str, pdf_bytes: bytes, cards: Sequence[Dict]) 
                 conn.execute(
                     """
                     INSERT INTO students(
-                        class_id, external_key, position, page, photo_path, label_path, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        class_id, external_key, position, page,
+                        first_name, last_name, name_source,
+                        photo_path, label_path, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         class_id,
                         card.get("external_key") or f"n{new_position:03d}",
                         new_position,
                         int(card.get("page", 1)),
+                        str(card.get("first_name", "")).strip(),
+                        str(card.get("last_name", "")).strip(),
+                        str(card.get("name_source", "")).strip(),
                         _stored_path(photo_path),
                         _stored_path(label_path),
                         _now(),
                     ),
                 )
-        return class_id
+        return int(class_id)
     except sqlite3.IntegrityError as exc:
         if folder and folder.exists():
             shutil.rmtree(folder, ignore_errors=True)
@@ -266,7 +294,7 @@ def memory_dates(conn: sqlite3.Connection, student_id: int, cycle_no: int) -> Li
         """,
         (student_id, cycle_no),
     ).fetchall()
-    return [row["memory_date"] for row in rows]
+    return [str(row["memory_date"]) for row in rows]
 
 
 def _student_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> Dict:
@@ -274,7 +302,10 @@ def _student_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> Dict:
     item["photo_path"] = str(resolve_data_path(item["photo_path"]))
     if item.get("label_path"):
         item["label_path"] = str(resolve_data_path(item["label_path"]))
-    item["memory_dates"] = memory_dates(conn, item["id"], item["cycle_no"])
+    item["memory_dates"] = memory_dates(conn, int(item["id"]), int(item["cycle_no"]))
+    if "class_name" not in item:
+        class_row = conn.execute("SELECT name FROM classes WHERE id=?", (item["class_id"],)).fetchone()
+        item["class_name"] = class_row["name"] if class_row else ""
     return item
 
 
@@ -282,138 +313,307 @@ def get_students(class_id: int) -> List[Dict]:
     init_db()
     with connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM students WHERE class_id=? ORDER BY position",
+            "SELECT s.*, c.name AS class_name FROM students s JOIN classes c ON c.id=s.class_id WHERE s.class_id=? ORDER BY s.position",
             (class_id,),
         ).fetchall()
         return [_student_dict(conn, row) for row in rows]
 
 
+def get_students_for_classes(class_ids: Sequence[int]) -> List[Dict]:
+    ids = _normalize_class_ids(class_ids)
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT s.*, c.name AS class_name
+            FROM students s JOIN classes c ON c.id=s.class_id
+            WHERE s.class_id IN ({placeholders})
+            ORDER BY c.name COLLATE NOCASE, s.last_name COLLATE NOCASE,
+                     s.first_name COLLATE NOCASE, s.position
+            """,
+            ids,
+        ).fetchall()
+        return [_student_dict(conn, row) for row in rows]
+
+
+def random_student(class_ids: Sequence[int], exclude_ids: Sequence[int] = ()) -> Optional[Dict]:
+    ids = _normalize_class_ids(class_ids)
+    if not ids:
+        return None
+    students = get_students_for_classes(ids)
+    if not students:
+        return None
+    blocked = {int(value) for value in exclude_ids}
+    candidates = [student for student in students if int(student["id"]) not in blocked]
+    if not candidates:
+        candidates = students
+    return random.choice(candidates)
+
+
 def update_student_name(student_id: int, first_name: str, last_name: str) -> None:
     with connect() as conn:
         conn.execute(
-            "UPDATE students SET first_name=?, last_name=? WHERE id=?",
+            "UPDATE students SET first_name=?, last_name=?, name_source='manuel' WHERE id=?",
             (first_name.strip(), last_name.strip(), student_id),
         )
 
 
 def class_stats(class_id: int) -> Dict[str, int]:
+    return multi_class_stats([class_id])
+
+
+def multi_class_stats(class_ids: Sequence[int]) -> Dict[str, int]:
+    ids = _normalize_class_ids(class_ids)
+    stats = {status: 0 for status in STATUS_LABELS}
+    if not ids:
+        stats["total"] = 0
+        return stats
+    placeholders = ",".join("?" for _ in ids)
     with connect() as conn:
         rows = conn.execute(
-            "SELECT status, COUNT(*) AS n FROM students WHERE class_id=? GROUP BY status",
-            (class_id,),
+            f"SELECT status, COUNT(*) AS n FROM students WHERE class_id IN ({placeholders}) GROUP BY status",
+            ids,
         ).fetchall()
-    stats = {status: 0 for status in STATUS_LABELS}
-    stats.update({row["status"]: int(row["n"]) for row in rows})
+    stats.update({str(row["status"]): int(row["n"]) for row in rows})
     stats["total"] = sum(stats.values())
     return stats
 
 
-def _shuffle_take(rows: Iterable[sqlite3.Row], remaining: int) -> List[int]:
-    ids = [int(row["id"]) for row in rows]
-    random.shuffle(ids)
-    return ids[:remaining]
+def _student_sort_key(row: sqlite3.Row) -> tuple:
+    has_name = bool(str(row["last_name"] or "").strip() or str(row["first_name"] or "").strip())
+    return (
+        0 if has_name else 1,
+        str(row["last_name"] or "").casefold(),
+        str(row["first_name"] or "").casefold(),
+        int(row["position"]),
+    )
 
 
-def get_today_open_session(class_id: int, on_date: Optional[date] = None) -> Optional[Dict]:
+def _session_class_ids(session: sqlite3.Row) -> List[int]:
+    return _parse_scope(session)
+
+
+def get_today_open_session_for_classes(
+    class_ids: int | Sequence[int], on_date: Optional[date] = None
+) -> Optional[Dict]:
+    ids = _normalize_class_ids(class_ids)
+    if not ids:
+        return None
     today = _today(on_date)
+    scope = _scope_key(ids)
     with connect() as conn:
         row = conn.execute(
             """
             SELECT * FROM sessions
-            WHERE class_id=? AND session_date=? AND completed_at IS NULL
+            WHERE session_date=? AND completed_at IS NULL
+              AND (
+                    class_scope=?
+                    OR (class_scope='' AND ?=1 AND class_id=?)
+                  )
             ORDER BY id DESC LIMIT 1
             """,
-            (class_id, today),
+            (today, scope, len(ids), ids[0]),
         ).fetchone()
         return dict(row) if row else None
 
 
-def start_or_resume_session(class_id: int, on_date: Optional[date] = None) -> Dict:
+def get_today_open_session(class_id: int, on_date: Optional[date] = None) -> Optional[Dict]:
+    return get_today_open_session_for_classes([class_id], on_date)
+
+
+def _already_in_session(conn: sqlite3.Connection, session_id: int) -> set[int]:
+    return {
+        int(row["student_id"])
+        for row in conn.execute(
+            "SELECT student_id FROM session_students WHERE session_id=?", (session_id,)
+        ).fetchall()
+    }
+
+
+def _active_count(conn: sqlite3.Connection, session_id: int) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM session_students WHERE session_id=? AND completed=0",
+        (session_id,),
+    ).fetchone()
+    return int(row["n"] or 0)
+
+
+def _eligible_rows(
+    conn: sqlite3.Connection,
+    class_ids: Sequence[int],
+    excluded: set[int],
+    today: str,
+) -> tuple[List[sqlite3.Row], List[sqlite3.Row], List[sqlite3.Row], List[sqlite3.Row]]:
+    if not class_ids:
+        return [], [], [], []
+    placeholders = ",".join("?" for _ in class_ids)
+    rows = conn.execute(
+        f"""
+        SELECT s.*, c.name AS class_name
+        FROM students s JOIN classes c ON c.id=s.class_id
+        WHERE s.class_id IN ({placeholders})
+        """,
+        class_ids,
+    ).fetchall()
+
+    memorised_due: List[sqlite3.Row] = []
+    seen: List[sqlite3.Row] = []
+    not_started: List[sqlite3.Row] = []
+    acquired: List[sqlite3.Row] = []
+
+    for student in rows:
+        sid = int(student["id"])
+        if sid in excluded:
+            continue
+        status = student["status"]
+        if status == STATUS_MEMORISE:
+            dates = memory_dates(conn, sid, int(student["cycle_no"]))
+            if not dates or dates[-1] < today:
+                memorised_due.append(student)
+        elif status == STATUS_VU:
+            seen.append(student)
+        elif status == STATUS_NON_COMMENCE:
+            not_started.append(student)
+        elif status == STATUS_ACQUIS:
+            acquired.append(student)
+
+    random.shuffle(memorised_due)
+    random.shuffle(seen)
+    random.shuffle(acquired)
+    not_started.sort(
+        key=lambda row: (str(row["class_name"]).casefold(),) + _student_sort_key(row)
+    )
+    return memorised_due, seen, not_started, acquired
+
+
+def _add_student_to_session(
+    conn: sqlite3.Connection, session_id: int, student: sqlite3.Row
+) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO session_students(session_id, student_id, initial_status)
+        VALUES (?, ?, ?)
+        """,
+        (session_id, int(student["id"]), str(student["status"])),
+    )
+    if student["status"] == STATUS_NON_COMMENCE:
+        conn.execute(
+            "UPDATE students SET status=? WHERE id=?",
+            (STATUS_VU, int(student["id"])),
+        )
+
+
+def _replenish_session(
+    conn: sqlite3.Connection,
+    session_id: int,
+    today: str,
+    prefer_non_started: bool = False,
+) -> int:
+    session = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if not session:
+        return 0
+    class_ids = _session_class_ids(session)
+    added = 0
+
+    while _active_count(conn, session_id) < 10:
+        excluded = _already_in_session(conn, session_id)
+        memorised_due, seen, not_started, acquired = _eligible_rows(conn, class_ids, excluded, today)
+        chosen: Optional[sqlite3.Row] = None
+
+        if int(session["maintenance_mode"]):
+            chosen = acquired[0] if acquired else None
+        elif prefer_non_started and not_started:
+            chosen = not_started[0]
+            prefer_non_started = False
+        elif memorised_due:
+            chosen = memorised_due[0]
+        elif seen:
+            chosen = seen[0]
+        elif not_started:
+            chosen = not_started[0]
+        else:
+            chosen = None
+
+        if chosen is None:
+            break
+        _add_student_to_session(conn, session_id, chosen)
+        added += 1
+
+    return added
+
+
+def start_or_resume_session(
+    class_ids: int | Sequence[int], on_date: Optional[date] = None
+) -> Dict:
     init_db()
-    today = _today(on_date)
-    existing = get_today_open_session(class_id, on_date)
+    ids = _normalize_class_ids(class_ids)
+    if not ids:
+        raise ValueError("Coche au moins une classe.")
+    existing = get_today_open_session_for_classes(ids, on_date)
     if existing:
         return existing
 
+    today = _today(on_date)
     with connect() as conn:
-        students = conn.execute(
-            "SELECT * FROM students WHERE class_id=? ORDER BY position",
-            (class_id,),
-        ).fetchall()
-        if not students:
-            raise ValueError("Cette classe ne contient aucun élève.")
+        placeholders = ",".join("?" for _ in ids)
+        total = int(
+            conn.execute(
+                f"SELECT COUNT(*) AS n FROM students WHERE class_id IN ({placeholders})", ids
+            ).fetchone()["n"]
+        )
+        if total == 0:
+            raise ValueError("Les classes cochées ne contiennent aucun élève.")
 
-        memorised_due, seen, not_started, acquired = [], [], [], []
-        for student in students:
-            if student["status"] == STATUS_MEMORISE:
-                dates = memory_dates(conn, student["id"], student["cycle_no"])
-                if not dates or dates[-1] < today:
-                    memorised_due.append(student)
-            elif student["status"] == STATUS_VU:
-                seen.append(student)
-            elif student["status"] == STATUS_NON_COMMENCE:
-                not_started.append(student)
-            elif student["status"] == STATUS_ACQUIS:
-                acquired.append(student)
-
-        all_acquired = len(acquired) == len(students)
-        selected: List[int] = []
-        maintenance = 0
-
-        if all_acquired:
-            maintenance = 1
-            selected = _shuffle_take(acquired, min(10, len(acquired)))
-        else:
-            for bucket in (memorised_due, seen, not_started):
-                if len(selected) >= 10:
-                    break
-                selected.extend(_shuffle_take(bucket, 10 - len(selected)))
-
-        if not selected:
-            raise ValueError(
-                "Rien à travailler pour le moment : les élèves à réviser ont déjà été faits aujourd'hui."
-            )
+        acquired = int(
+            conn.execute(
+                f"SELECT COUNT(*) AS n FROM students WHERE class_id IN ({placeholders}) AND status=?",
+                [*ids, STATUS_ACQUIS],
+            ).fetchone()["n"]
+        )
+        maintenance = int(acquired == total)
 
         cursor = conn.execute(
             """
-            INSERT INTO sessions(class_id, session_date, started_at, maintenance_mode)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO sessions(class_id, class_scope, session_date, started_at, maintenance_mode)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (class_id, today, _now(), maintenance),
+            (ids[0], _scope_key(ids), today, _now(), maintenance),
         )
         session_id = int(cursor.lastrowid)
+        _replenish_session(conn, session_id, today)
 
-        for student_id in selected:
-            student = conn.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
-            initial_status = student["status"]
-            conn.execute(
-                """
-                INSERT INTO session_students(session_id, student_id, initial_status)
-                VALUES (?, ?, ?)
-                """,
-                (session_id, student_id, initial_status),
+        if _active_count(conn, session_id) == 0:
+            conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+            raise ValueError(
+                "Rien à travailler aujourd'hui : les élèves à réviser ont déjà été faits."
             )
-            if initial_status == STATUS_NON_COMMENCE:
-                conn.execute("UPDATE students SET status=? WHERE id=?", (STATUS_VU, student_id))
-
         return dict(conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone())
 
 
 def get_session(session_id: int) -> Optional[Dict]:
     with connect() as conn:
         row = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        item = dict(row)
+        item["class_ids"] = _session_class_ids(row)
+        return item
 
 
 def get_session_students(session_id: int) -> List[Dict]:
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT s.*, ss.correct_count, ss.completed, ss.initial_status
+            SELECT s.*, c.name AS class_name,
+                   ss.correct_count, ss.completed, ss.initial_status
             FROM session_students ss
             JOIN students s ON s.id=ss.student_id
+            JOIN classes c ON c.id=s.class_id
             WHERE ss.session_id=?
-            ORDER BY s.position
+            ORDER BY ss.completed, c.name COLLATE NOCASE,
+                     s.last_name COLLATE NOCASE, s.first_name COLLATE NOCASE, s.position
             """,
             (session_id,),
         ).fetchall()
@@ -424,9 +624,10 @@ def next_student(session_id: int) -> Optional[Dict]:
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT s.*, ss.correct_count, ss.completed
+            SELECT s.*, c.name AS class_name, ss.correct_count, ss.completed
             FROM session_students ss
             JOIN students s ON s.id=ss.student_id
+            JOIN classes c ON c.id=s.class_id
             WHERE ss.session_id=? AND ss.completed=0
             """,
             (session_id,),
@@ -435,11 +636,7 @@ def next_student(session_id: int) -> Optional[Dict]:
             return None
 
         recent_rows = conn.execute(
-            """
-            SELECT student_id FROM attempts
-            WHERE session_id=?
-            ORDER BY id DESC LIMIT 5
-            """,
+            "SELECT student_id FROM attempts WHERE session_id=? ORDER BY id DESC LIMIT 5",
             (session_id,),
         ).fetchall()
         recent = [int(row["student_id"]) for row in recent_rows]
@@ -447,26 +644,26 @@ def next_student(session_id: int) -> Optional[Dict]:
         candidates = list(rows)
         for blocked_count in range(len(recent), -1, -1):
             blocked = set(recent[:blocked_count])
-            pool = [row for row in rows if row["id"] not in blocked]
+            pool = [row for row in rows if int(row["id"]) not in blocked]
             if pool:
                 candidates = pool
                 break
-
         return _student_dict(conn, random.choice(candidates))
 
 
 def _finish_session_if_needed(conn: sqlite3.Connection, session_id: int) -> bool:
-    remaining = conn.execute(
-        "SELECT COUNT(*) AS n FROM session_students WHERE session_id=? AND completed=0",
-        (session_id,),
-    ).fetchone()["n"]
-    if remaining == 0:
+    if _active_count(conn, session_id) == 0:
         conn.execute("UPDATE sessions SET completed_at=? WHERE id=?", (_now(), session_id))
         return True
     return False
 
 
-def record_answer(session_id: int, student_id: int, correct: bool, on_date: Optional[date] = None) -> Dict:
+def record_answer(
+    session_id: int,
+    student_id: int,
+    correct: bool,
+    on_date: Optional[date] = None,
+) -> Dict:
     today = _today(on_date)
     with connect() as conn:
         session = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
@@ -488,11 +685,12 @@ def record_answer(session_id: int, student_id: int, correct: bool, on_date: Opti
 
         correct_count = int(ss["correct_count"])
         completed = 0
+        became_memorised_today = False
         message = ""
 
-        if session["maintenance_mode"]:
-            completed = 1
+        if int(session["maintenance_mode"]):
             if correct:
+                completed = 1
                 message = "Toujours acquis 👍"
             else:
                 new_cycle = int(student["cycle_no"]) + 1
@@ -500,7 +698,12 @@ def record_answer(session_id: int, student_id: int, correct: bool, on_date: Opti
                     "UPDATE students SET status=?, cycle_no=? WHERE id=?",
                     (STATUS_VU, new_cycle, student_id),
                 )
-                message = "Oublié : il repasse en Vu et recommence un cycle."
+                conn.execute(
+                    "UPDATE session_students SET correct_count=0 WHERE session_id=? AND student_id=?",
+                    (session_id, student_id),
+                )
+                correct_count = 0
+                message = "Oublié : retour à Vu, nouveau cycle à zéro."
 
         elif student["status"] == STATUS_MEMORISE:
             if correct:
@@ -509,11 +712,14 @@ def record_answer(session_id: int, student_id: int, correct: bool, on_date: Opti
                     INSERT OR IGNORE INTO memory_days(student_id, cycle_no, memory_date, created_at)
                     VALUES (?, ?, ?, ?)
                     """,
-                    (student_id, student["cycle_no"], today, _now()),
+                    (student_id, int(student["cycle_no"]), today, _now()),
                 )
                 dates = memory_dates(conn, student_id, int(student["cycle_no"]))
                 if len(dates) >= 3:
-                    conn.execute("UPDATE students SET status=? WHERE id=?", (STATUS_ACQUIS, student_id))
+                    conn.execute(
+                        "UPDATE students SET status=? WHERE id=?",
+                        (STATUS_ACQUIS, student_id),
+                    )
                     message = "Acquis 🎉 — mémorisé sur 3 jours différents."
                 else:
                     message = f"Mémorisé sur {len(dates)}/3 jour(s)."
@@ -524,11 +730,11 @@ def record_answer(session_id: int, student_id: int, correct: bool, on_date: Opti
                     "UPDATE students SET status=?, cycle_no=? WHERE id=?",
                     (STATUS_VU, new_cycle, student_id),
                 )
-                correct_count = 0
                 conn.execute(
                     "UPDATE session_students SET correct_count=0 WHERE session_id=? AND student_id=?",
                     (session_id, student_id),
                 )
+                correct_count = 0
                 message = "Raté : retour à Vu, nouveau cycle à zéro."
 
         else:
@@ -544,10 +750,14 @@ def record_answer(session_id: int, student_id: int, correct: bool, on_date: Opti
                         INSERT OR IGNORE INTO memory_days(student_id, cycle_no, memory_date, created_at)
                         VALUES (?, ?, ?, ?)
                         """,
-                        (student_id, student["cycle_no"], today, _now()),
+                        (student_id, int(student["cycle_no"]), today, _now()),
                     )
-                    conn.execute("UPDATE students SET status=? WHERE id=?", (STATUS_MEMORISE, student_id))
+                    conn.execute(
+                        "UPDATE students SET status=? WHERE id=?",
+                        (STATUS_MEMORISE, student_id),
+                    )
                     completed = 1
+                    became_memorised_today = True
                     message = "Mémorisé pour aujourd'hui ✅"
                 else:
                     message = f"Bonne réponse : {correct_count}/3 dans cette session."
@@ -560,15 +770,23 @@ def record_answer(session_id: int, student_id: int, correct: bool, on_date: Opti
                 (session_id, student_id),
             )
 
+        _replenish_session(
+            conn,
+            session_id,
+            today,
+            prefer_non_started=became_memorised_today,
+        )
+
         refreshed = conn.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
         dates = memory_dates(conn, student_id, int(refreshed["cycle_no"]))
         finished = _finish_session_if_needed(conn, session_id)
         return {
-            "status": refreshed["status"],
+            "status": str(refreshed["status"]),
             "correct_count": correct_count,
             "memory_dates": dates,
             "message": message,
             "session_finished": finished,
+            "active_count": _active_count(conn, session_id),
         }
 
 
@@ -576,18 +794,21 @@ def session_progress(session_id: int) -> Dict[str, int]:
     with connect() as conn:
         row = conn.execute(
             """
-            SELECT COUNT(*) AS total, SUM(completed) AS completed
+            SELECT COUNT(*) AS introduced,
+                   SUM(CASE WHEN completed=1 THEN 1 ELSE 0 END) AS completed,
+                   SUM(CASE WHEN completed=0 THEN 1 ELSE 0 END) AS active
             FROM session_students WHERE session_id=?
             """,
             (session_id,),
         ).fetchone()
         attempts = conn.execute(
-            "SELECT COUNT(*) AS n FROM attempts WHERE session_id=?",
-            (session_id,),
+            "SELECT COUNT(*) AS n FROM attempts WHERE session_id=?", (session_id,)
         ).fetchone()["n"]
         return {
-            "total": int(row["total"] or 0),
+            "total": int(row["introduced"] or 0),
+            "introduced": int(row["introduced"] or 0),
             "completed": int(row["completed"] or 0),
+            "active": int(row["active"] or 0),
             "attempts": int(attempts or 0),
         }
 
