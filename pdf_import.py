@@ -85,12 +85,12 @@ def _row_label_band(page: fitz.Page, rows: List[List[Dict]], row_index: int) -> 
 
 
 def _cell_ranges(page: fitz.Page, row: List[Dict]) -> Tuple[List[float], List[Tuple[float, float]]]:
-    """Return label ownership ranges anchored on portrait left edges.
+    """Return one horizontal label cell per portrait.
 
-    Pronote labels can be wider than the portrait and overflow to the right,
-    while their left edge stays aligned with the portrait. Midpoint-based cells
-    therefore cut long names too early. A card owns the horizontal space from
-    its portrait's left edge up to the next portrait's left edge.
+    Pronote starts each label at the same x coordinate as its portrait and
+    wraps long labels before the next portrait starts. Using those portrait
+    left edges as hard cell boundaries lets us crop each student's answer
+    before text recognition, so neighbouring names can never be merged first.
     """
     anchors = [float(item["rect"].x0) for item in row]
     if not anchors:
@@ -145,12 +145,7 @@ def _assign_cell(
     anchors: Sequence[float],
     ranges: Sequence[Tuple[float, float]],
 ) -> int:
-    """Assign text using its left edge, not its centre or total width.
-
-    A long name may extend far into the space on its right. Its left edge still
-    identifies the portrait it belongs to. A tiny snap tolerance handles OCR
-    boxes that begin a couple of pixels before the visible portrait edge.
-    """
+    """Compatibility helper used by tests and older PDF layouts."""
     if not anchors:
         return 0
 
@@ -199,22 +194,14 @@ def _group_fragments_into_lines(
     return lines
 
 
-def _pdf_lines_for_row(
-    page: fitz.Page,
-    band: fitz.Rect,
-    anchors: Sequence[float],
-    ranges: Sequence[Tuple[float, float]],
-) -> List[List[str]]:
-    grouped: List[List[Tuple[float, float, float, float, str]]] = [[] for _ in anchors]
-    for word in page.get_text("words", clip=band):
+def _pdf_lines_for_cell(page: fitz.Page, clip: fitz.Rect) -> List[str]:
+    fragments: List[Tuple[float, float, float, float, str]] = []
+    for word in page.get_text("words", clip=clip):
         x0, y0, x1, y1, text = word[:5]
         text = str(text).strip()
-        if not text:
-            continue
-        idx = _assign_cell(float(x0), float(x1), anchors, ranges)
-        grouped[idx].append((float(x0), float(y0), float(x1), float(y1), text))
-
-    return [_group_fragments_into_lines(parts) for parts in grouped]
+        if text:
+            fragments.append((float(x0), float(y0), float(x1), float(y1), text))
+    return _group_fragments_into_lines(fragments)
 
 
 def _get_ocr_engine():
@@ -235,14 +222,20 @@ def _get_ocr_engine():
 
 def _ocr_lines_for_cell(
     page: fitz.Page,
-    band: fitz.Rect,
-    anchors: Sequence[float],
-    ranges: Sequence[Tuple[float, float]],
+    clip: fitz.Rect,
     zoom: float = 4.5,
-) -> List[List[str]]:
+) -> List[str]:
+    """Read exactly one Pronote card label.
+
+    The old implementation read a whole row first and then tried to split the
+    recognised boxes between students. On tight rows, the recogniser could
+    merge e.g. "MEGHERBI Ahmed" and "MEYER Romane" into one box before our code
+    got a chance to separate them. Cropping one cell first makes that merge
+    impossible.
+    """
     engine = _get_ocr_engine()
     if engine is None:
-        return [[] for _ in anchors]
+        return []
 
     try:
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
@@ -251,9 +244,9 @@ def _ocr_lines_for_cell(
         boxes = getattr(result, "boxes", None)
         scores = getattr(result, "scores", None)
         if txts is None or boxes is None:
-            return [[] for _ in anchors]
+            return []
 
-        grouped: List[List[Tuple[float, float, float, float, str]]] = [[] for _ in anchors]
+        fragments: List[Tuple[float, float, float, float, str]] = []
         for index, text in enumerate(txts):
             text = str(text).strip()
             if not text:
@@ -264,16 +257,15 @@ def _ocr_lines_for_cell(
             box = boxes[index]
             xs = [float(point[0]) for point in box]
             ys = [float(point[1]) for point in box]
-            x0 = band.x0 + min(xs) / zoom
-            x1 = band.x0 + max(xs) / zoom
-            y0 = band.y0 + min(ys) / zoom
-            y1 = band.y0 + max(ys) / zoom
-            idx = _assign_cell(x0, x1, anchors, ranges)
-            grouped[idx].append((x0, y0, x1, y1, text))
+            x0 = clip.x0 + min(xs) / zoom
+            x1 = clip.x0 + max(xs) / zoom
+            y0 = clip.y0 + min(ys) / zoom
+            y1 = clip.y0 + max(ys) / zoom
+            fragments.append((x0, y0, x1, y1, text))
 
-        return [_group_fragments_into_lines(parts) for parts in grouped]
+        return _group_fragments_into_lines(fragments)
     except Exception:
-        return [[] for _ in anchors]
+        return []
 
 
 def _clean_name_line(value: str) -> str:
@@ -317,24 +309,37 @@ def _is_upper_name_token(token: str) -> bool:
     return bool(letters) and letters == letters.upper()
 
 
+def _join_wrapped_tokens(lines: Sequence[str]) -> List[str]:
+    """Flatten visual lines while keeping hyphenated wrapped names together."""
+    tokens: List[str] = []
+    for line in _clean_lines(lines):
+        for raw_token in line.split():
+            token = re.sub(r"-{2,}", "-", raw_token)
+            if tokens and tokens[-1].endswith("-"):
+                tokens[-1] = tokens[-1] + token
+            else:
+                tokens.append(token)
+    return tokens
+
+
 def _name_case(value: str) -> str:
     return " ".join(part.title() for part in value.split())
 
 
 def split_pronote_name(value: str, lines: Sequence[str] | None = None) -> Tuple[str, str]:
-    """Return (first_name, last_name) while preserving Pronote label structure."""
+    """Return (first_name, last_name) from Pronote's SURNAME Firstname format.
+
+    Pronote wraps at the card boundary. The surname may span several visual
+    lines (RAMIREZ / ELIZALDE Brandon) and either surname or first name may be
+    hyphenated at a line break (MARCHAND- / TAVENAUX Sacha,
+    GRUMBERG John- / Alexandre).
+    """
     cleaned_lines = _clean_lines(lines or [])
+    tokens = _join_wrapped_tokens(cleaned_lines)
 
-    if len(cleaned_lines) >= 2:
-        top_tokens = cleaned_lines[0].split()
-        if top_tokens and all(_is_upper_name_token(token) for token in top_tokens):
-            surname = cleaned_lines[0]
-            first = " ".join(cleaned_lines[1:])
-            if first:
-                return _name_case(first), _name_case(surname)
-
-    text = _clean_name_text(value or " ".join(cleaned_lines))
-    tokens = text.split()
+    if not tokens:
+        cleaned_value = _clean_name_text(value)
+        tokens = _join_wrapped_tokens([cleaned_value]) if cleaned_value else []
     if not tokens:
         return "", ""
 
@@ -377,12 +382,6 @@ def extract_cards(pdf_bytes: bytes) -> List[Dict]:
 
         for row_index, row in enumerate(rows):
             band = _row_label_band(page, rows, row_index)
-            anchors, ranges = _cell_ranges(page, row)
-            pdf_lines = _pdf_lines_for_row(page, band, anchors, ranges)
-            need_ocr = [not _clean_lines(lines) for lines in pdf_lines]
-            ocr_lines = [[] for _ in row]
-            if any(need_ocr):
-                ocr_lines = _ocr_lines_for_row(page, band, anchors, ranges)
 
             for col_index, item in enumerate(row):
                 global_index += 1
