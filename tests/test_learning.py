@@ -12,6 +12,7 @@ os.environ["FLASH_TROMBI_DATA_DIR"] = str(Path(TEMP_ROOT.name) / "data")
 from storage import (  # noqa: E402
     STATUS_ACQUIS,
     STATUS_MEMORISE,
+    STATUS_NON_COMMENCE,
     STATUS_VU,
     create_class_from_cards,
     get_session_students,
@@ -61,6 +62,27 @@ def memorise_everyone_today(class_id: int, day: date) -> None:
 
 
 class LearningWorkflowTests(unittest.TestCase):
+    def test_waiting_students_stay_new_until_first_card_is_shown(self):
+        class_id = create_class_from_cards(
+            "WAITING",
+            b"fake-pdf",
+            cards([(f"Prenom{i:02d}", f"Nom{i:02d}") for i in range(1, 11)]),
+        )
+        session = start_or_resume_session(class_id, date(2026, 1, 1))
+
+        queued = get_session_students(session["id"])
+        self.assertEqual(10, len(queued))
+        self.assertTrue(all(student["status"] == STATUS_NON_COMMENCE for student in queued))
+
+        shown = next_student(session["id"])
+        self.assertEqual(STATUS_VU, shown["status"])
+
+        refreshed = get_session_students(session["id"])
+        seen_ids = [student["id"] for student in refreshed if student["status"] == STATUS_VU]
+        new_ids = [student["id"] for student in refreshed if student["status"] == STATUS_NON_COMMENCE]
+        self.assertEqual([shown["id"]], seen_ids)
+        self.assertEqual(9, len(new_ids))
+
     def test_group_is_kept_at_ten_when_new_students_remain(self):
         names = [(f"Prenom{i:02d}", f"Nom{i:02d}") for i in range(1, 15)]
         class_id = create_class_from_cards("GROUPE", b"fake-pdf", cards(names))
