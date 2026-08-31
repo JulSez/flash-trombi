@@ -50,6 +50,17 @@ def cards(names: list[tuple[str, str]]):
     ]
 
 
+def memorise_everyone_today(class_id: int, day: date) -> None:
+    session = start_or_resume_session(class_id, day)
+    while True:
+        active = [s for s in get_session_students(session["id"]) if not s["completed"]]
+        if not active:
+            return
+        for student in active:
+            for _ in range(3):
+                record_answer(session["id"], student["id"], True, day)
+
+
 class LearningWorkflowTests(unittest.TestCase):
     def test_waiting_students_stay_new_until_first_display(self):
         class_id = create_class_from_cards(
@@ -134,6 +145,63 @@ class LearningWorkflowTests(unittest.TestCase):
         self.assertEqual(STATUS_VU, result["status"])
         self.assertEqual([], refreshed["memory_dates"])
         self.assertEqual(2, refreshed["cycle_no"])
+
+    def test_memorised_only_session_uses_ten_and_retries_misses_at_end(self):
+        class_id = create_class_from_cards(
+            "MEM-ONLY",
+            b"fake-pdf",
+            cards([(f"Prenom{i:02d}", f"Nom{i:02d}") for i in range(1, 13)]),
+        )
+        day = date(2026, 5, 1)
+        memorise_everyone_today(class_id, day)
+
+        session = start_or_resume_session(class_id, day)
+        self.assertEqual(1, int(session["memorised_review_mode"]))
+        group = get_session_students(session["id"])
+        self.assertEqual(10, len(group))
+
+        missed = next_student(session["id"])
+        result = record_answer(session["id"], missed["id"], False, day)
+        self.assertFalse(result["session_finished"])
+
+        refreshed_group = get_session_students(session["id"])
+        missed_row = next(s for s in refreshed_group if s["id"] == missed["id"])
+        self.assertEqual(1, missed_row["review_first_done"])
+        self.assertEqual(1, missed_row["review_failed"])
+        self.assertEqual(0, missed_row["completed"])
+
+        while True:
+            remaining_first_pass = [
+                s
+                for s in get_session_students(session["id"])
+                if not s["completed"] and not s["review_first_done"]
+            ]
+            if not remaining_first_pass:
+                break
+            record_answer(session["id"], remaining_first_pass[0]["id"], True, day)
+
+        retry = next_student(session["id"])
+        self.assertEqual(missed["id"], retry["id"])
+        result = record_answer(session["id"], retry["id"], True, day)
+        self.assertTrue(result["session_finished"])
+        self.assertEqual(STATUS_MEMORISE, get_students(class_id)[missed["position"] - 1]["status"])
+
+    def test_second_miss_in_memorised_only_review_restarts_cycle(self):
+        class_id = create_class_from_cards("MEM-FAIL", b"fake-pdf", cards([("Jean", "Test")]))
+        day = date(2026, 5, 2)
+        memorise_everyone_today(class_id, day)
+        session = start_or_resume_session(class_id, day)
+
+        student = next_student(session["id"])
+        record_answer(session["id"], student["id"], False, day)
+        retry = next_student(session["id"])
+        result = record_answer(session["id"], retry["id"], False, day)
+
+        refreshed = get_students(class_id)[0]
+        self.assertTrue(result["session_finished"])
+        self.assertEqual(STATUS_VU, refreshed["status"])
+        self.assertEqual(2, refreshed["cycle_no"])
+        self.assertEqual([], refreshed["memory_dates"])
 
     def test_display_stages_include_review_day(self):
         self.assertEqual(STAGE_NEW, display_stage({"status": "non_commence"}, date(2026, 4, 1)))
