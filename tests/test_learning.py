@@ -12,10 +12,12 @@ os.environ["FLASH_TROMBI_DATA_DIR"] = str(Path(TEMP_ROOT.name) / "data")
 from storage import (  # noqa: E402
     STATUS_ACQUIS,
     STATUS_MEMORISE,
+    STATUS_NON_COMMENCE,
     STATUS_VU,
     create_class_from_cards,
     get_session_students,
     get_students,
+    next_student,
     record_answer,
     start_or_resume_session,
 )
@@ -49,6 +51,26 @@ def cards(names: list[tuple[str, str]]):
 
 
 class LearningWorkflowTests(unittest.TestCase):
+    def test_waiting_students_stay_new_until_first_display(self):
+        class_id = create_class_from_cards(
+            "AFFICHAGE",
+            b"fake-pdf",
+            cards([(f"Prenom{i}", f"Nom{i}") for i in range(1, 12)]),
+        )
+        session = start_or_resume_session(class_id, date(2026, 5, 1))
+        waiting = get_session_students(session["id"])
+        self.assertEqual(10, len(waiting))
+        self.assertTrue(all(student["status"] == STATUS_NON_COMMENCE for student in waiting))
+
+        displayed = next_student(session["id"])
+        self.assertEqual(STATUS_VU, displayed["status"])
+
+        after = get_session_students(session["id"])
+        seen = [student for student in after if student["status"] == STATUS_VU]
+        still_waiting = [student for student in after if student["status"] == STATUS_NON_COMMENCE]
+        self.assertEqual(1, len(seen))
+        self.assertEqual(9, len(still_waiting))
+
     def test_group_is_kept_at_ten_when_new_students_remain(self):
         names = [(f"Prenom{i:02d}", f"Nom{i:02d}") for i in range(1, 15)]
         class_id = create_class_from_cards("GROUPE", b"fake-pdf", cards(names))
@@ -56,7 +78,7 @@ class LearningWorkflowTests(unittest.TestCase):
         active = [s for s in get_session_students(session["id"]) if not s["completed"]]
         self.assertEqual(10, len(active))
 
-        student = active[0]
+        student = next_student(session["id"])
         for _ in range(3):
             result = record_answer(session["id"], student["id"], True, date(2026, 1, 1))
         self.assertEqual(STATUS_MEMORISE, result["status"])
@@ -86,13 +108,14 @@ class LearningWorkflowTests(unittest.TestCase):
     def test_three_successes_then_three_days_acquires(self):
         class_id = create_class_from_cards("ACQUIS", b"fake-pdf", cards([("Jean", "Test")]))
         session = start_or_resume_session(class_id, date(2026, 1, 1))
-        student = get_session_students(session["id"])[0]
+        student = next_student(session["id"])
         for _ in range(3):
             result = record_answer(session["id"], student["id"], True, date(2026, 1, 1))
         self.assertEqual(STATUS_MEMORISE, result["status"])
 
         for day in (2, 3):
             session = start_or_resume_session(class_id, date(2026, 1, day))
+            student = next_student(session["id"])
             result = record_answer(session["id"], student["id"], True, date(2026, 1, day))
 
         self.assertEqual(STATUS_ACQUIS, result["status"])
@@ -100,11 +123,12 @@ class LearningWorkflowTests(unittest.TestCase):
     def test_failed_review_restarts_cycle(self):
         class_id = create_class_from_cards("RESET", b"fake-pdf", cards([("Jean", "Reset")]))
         session = start_or_resume_session(class_id, date(2026, 2, 1))
-        student = get_session_students(session["id"])[0]
+        student = next_student(session["id"])
         for _ in range(3):
             record_answer(session["id"], student["id"], True, date(2026, 2, 1))
 
         session = start_or_resume_session(class_id, date(2026, 2, 2))
+        student = next_student(session["id"])
         result = record_answer(session["id"], student["id"], False, date(2026, 2, 2))
         refreshed = get_students(class_id)[0]
         self.assertEqual(STATUS_VU, result["status"])
