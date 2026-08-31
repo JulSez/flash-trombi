@@ -5,12 +5,10 @@ from pathlib import Path
 
 import streamlit as st
 
-from paths import DATA_DIR
+from progress_view import STAGE_LABELS, STAGE_ORDER, display_stage, mastery_ratio, stage_counts
 from storage import (
-    STATUS_LABELS,
     analyze_pdf,
     class_name_exists,
-    class_stats,
     create_backup_bytes,
     create_class_from_cards,
     delete_class,
@@ -21,7 +19,6 @@ from storage import (
     get_today_open_session_for_classes,
     init_db,
     list_classes,
-    multi_class_stats,
     next_student,
     random_student,
     record_answer,
@@ -31,7 +28,6 @@ from storage import (
     update_student_name,
 )
 from updates import check_for_update
-from version import APP_VERSION
 
 st.set_page_config(
     page_title="Flash Trombi",
@@ -58,20 +54,14 @@ def student_display_name(student: dict) -> str:
 
 
 def show_answer(student: dict) -> None:
-    has_text = bool(student.get("first_name") or student.get("last_name"))
-    if has_text:
+    if student.get("first_name") or student.get("last_name"):
         st.success(student_display_name(student))
-        source = student.get("name_source")
-        if source == "ocr":
-            st.caption("Nom lu automatiquement depuis l'impression du PDF.")
-        elif source == "pdf":
-            st.caption("Nom extrait directement du texte du PDF.")
         return
 
     label_path = student.get("label_path")
     if label_path and Path(label_path).exists():
         st.image(label_path, caption="Nom sur le trombinoscope", width=500)
-        st.caption("Le nom n'a pas pu être lu automatiquement. Tu peux le corriger dans « Gérer les classes ».")
+        st.caption("Tu peux corriger ce nom dans « Gérer les classes ».")
     else:
         st.warning("Nom non renseigné.")
 
@@ -135,7 +125,7 @@ def choose_random_student(class_ids: list[int]) -> None:
     recent = list(st.session_state.get("random_recent", []))[-5:]
     student = random_student(class_ids, recent)
     if student is None:
-        st.session_state["friendly_error"] = "Aucun élève dans les classes cochées."
+        st.session_state["friendly_error"] = "Aucun élève dans les classes sélectionnées."
         return
     st.session_state["random_student"] = student
     recent.append(int(student["id"]))
@@ -150,38 +140,52 @@ def clear_analysis() -> None:
             st.session_state.pop(key, None)
 
 
+def selected_students(class_ids: list[int]) -> list[dict]:
+    selected: list[dict] = []
+    for class_id in class_ids:
+        selected.extend(get_students(class_id))
+    return selected
+
+
 def active_class_selector(classes: list[dict]) -> list[int]:
     if not classes:
         return []
+
     with st.container(border=True):
-        st.markdown("**Classes actives**")
-        st.caption("Coche/décoche les classes utilisées pour l'entraînement et le tirage au hasard.")
+        st.markdown("**Classes sélectionnées**")
         columns = st.columns(min(5, max(1, len(classes))))
         active: list[int] = []
+
         for index, class_row in enumerate(classes):
             class_id = int(class_row["id"])
             key = f"active_class_{class_id}"
             if key not in st.session_state:
                 st.session_state[key] = True
             with columns[index % len(columns)]:
-                checked = st.checkbox(class_row["name"], key=key)
+                st.markdown(f"**{class_row['name']}**")
+                checked = st.checkbox(
+                    "Sélectionner",
+                    key=key,
+                    label_visibility="collapsed",
+                )
             if checked:
                 active.append(class_id)
+
         if not active:
-            st.warning("Coche au moins une classe pour t'entraîner.")
+            st.warning("Sélectionne au moins une classe.")
         return active
 
 
-def status_metrics(class_ids: list[int]) -> None:
-    stats = multi_class_stats(class_ids)
-    cols = st.columns(4)
-    for col, status in zip(cols, ["non_commence", "vu", "memorise", "acquis"]):
-        col.metric(STATUS_LABELS[status], stats[status])
+def status_metrics(students: list[dict]) -> None:
+    counts = stage_counts(students)
+    cols = st.columns(5)
+    for col, stage in zip(cols, STAGE_ORDER):
+        col.metric(STAGE_LABELS[stage], counts[stage])
 
 
 def page_home(classes: list[dict]) -> None:
     st.title("🧑‍🏫 Flash Trombi")
-    st.caption("Apprendre les prénoms et noms de tes élèves, sans terminal ni tableur.")
+    st.caption("Apprendre les noms de tes élèves, simplement.")
 
     if not classes:
         st.info("Tu n'as encore aucune classe.")
@@ -192,32 +196,32 @@ def page_home(classes: list[dict]) -> None:
             on_click=go_to,
             args=(NAV_ADD,),
         )
-        st.markdown("**Comment ça marche ?** PDF → vérification des portraits → entraînement.")
         return
 
     st.subheader("Mes classes")
     for class_row in classes:
-        total = int(class_row.get("student_count") or 0)
-        acquired = int(class_row.get("acquired_count") or 0)
+        class_id = int(class_row["id"])
+        students = get_students(class_id)
+        total = len(students)
+        ratio = mastery_ratio(students)
+
         with st.container(border=True):
             left, middle, right = st.columns([2.1, 2.3, 1.2])
             with left:
                 st.markdown(f"### {class_row['name']}")
                 st.caption(f"{total} élève(s)")
             with middle:
-                ratio = acquired / max(1, total)
                 st.progress(ratio)
-                st.caption(f"{acquired}/{total} acquis")
             with right:
-                open_session = get_today_open_session(int(class_row["id"]))
+                open_session = get_today_open_session(class_id)
                 label = "▶️ Reprendre" if open_session else "▶️ Continuer"
                 st.button(
                     label,
-                    key=f"home_train_{class_row['id']}",
+                    key=f"home_train_{class_id}",
                     type="primary",
                     use_container_width=True,
                     on_click=go_training,
-                    args=(int(class_row["id"]),),
+                    args=(class_id,),
                 )
 
     st.button("➕ Ajouter une classe", on_click=go_to, args=(NAV_ADD,))
@@ -225,7 +229,7 @@ def page_home(classes: list[dict]) -> None:
 
 def page_add_class() -> None:
     st.title("➕ Ajouter une classe")
-    st.write("1 PDF = 1 classe. Donne-lui un nom puis vérifie les portraits et les noms détectés.")
+    st.write("Choisis le trombinoscope et donne un nom à la classe.")
 
     c1, c2 = st.columns([1, 2])
     with c1:
@@ -234,14 +238,14 @@ def page_add_class() -> None:
         uploaded = st.file_uploader("Trombinoscope PDF", type=["pdf"])
 
     can_analyze = bool(class_name.strip() and uploaded is not None)
-    if st.button("🔎 Analyser le PDF", type="primary", disabled=not can_analyze):
+    if st.button("🔎 Vérifier le trombinoscope", type="primary", disabled=not can_analyze):
         name = class_name.strip()
         if class_name_exists(name):
             st.error("Une classe portant ce nom existe déjà. Choisis un autre nom.")
         else:
             try:
                 pdf_bytes = uploaded.getvalue()
-                with st.spinner("Je détecte les portraits et je lis les noms… Le premier OCR peut prendre quelques secondes."):
+                with st.spinner("Lecture du trombinoscope…"):
                     cards = analyze_pdf(pdf_bytes)
                 if not cards:
                     st.error("Je n'ai trouvé aucun portrait exploitable dans ce PDF.")
@@ -259,13 +263,12 @@ def page_add_class() -> None:
 
     analysis = st.session_state.get("pdf_analysis")
     if not analysis:
-        st.caption("Le PDF, l'OCR et les données d'élèves restent uniquement sur cet ordinateur.")
         return
 
     cards = analysis["cards"]
     named = sum(bool(card.get("first_name") or card.get("last_name")) for card in cards)
-    st.success(f"{len(cards)} portrait(s) détecté(s) · {named} nom(s) lu(s) automatiquement.")
-    st.caption("Décoche une vignette si ce n'est pas un élève. Les noms peuvent être corrigés ensuite dans « Gérer les classes ».")
+    st.success(f"{len(cards)} portrait(s) détecté(s) · {named} nom(s) trouvé(s).")
+    st.caption("Vérifie rapidement les portraits. Tu pourras corriger les noms plus tard.")
 
     columns = st.columns(5)
     for index, card in enumerate(cards):
@@ -277,21 +280,18 @@ def page_add_class() -> None:
                 ).strip()
                 if detected:
                     st.markdown(f"**{detected}**")
-                    st.caption("Texte PDF" if card.get("name_source") == "pdf" else "OCR local")
                 else:
                     st.image(card["label_bytes"], width=190)
-                    st.caption("Nom non lu")
                 st.checkbox("Garder", value=True, key=f"keep_card_{index}")
 
     selected_cards = [
         card for index, card in enumerate(cards) if st.session_state.get(f"keep_card_{index}", True)
     ]
-    st.caption(f"{len(selected_cards)} portrait(s) seront ajoutés à « {analysis['class_name']} ».")
 
     b1, b2 = st.columns([2, 1])
     with b1:
         if st.button(
-            "✅ Tout est bon — créer la classe",
+            "✅ Créer la classe",
             type="primary",
             use_container_width=True,
             disabled=not selected_cards,
@@ -304,7 +304,7 @@ def page_add_class() -> None:
                 clear_analysis()
                 st.session_state[f"active_class_{class_id}"] = True
                 st.session_state["nav"] = NAV_HOME
-                st.session_state["welcome_message"] = "Classe créée avec succès."
+                st.session_state["welcome_message"] = "Classe créée."
                 st.rerun()
             except Exception as exc:
                 st.error(str(exc))
@@ -320,16 +320,12 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
         st.info("Ajoute d'abord une classe.")
         return
     if not active_ids:
-        st.info("Coche au moins une classe en haut.")
+        st.info("Sélectionne au moins une classe en haut.")
         return
 
     active_names = [row["name"] for row in classes if int(row["id"]) in active_ids]
-    st.caption("Classes : " + " · ".join(active_names))
-    status_metrics(active_ids)
-    st.caption(
-        "Groupe roulant de 10 : Mémorisé → Vu → Non commencé. Quand un élève devient mémorisé, "
-        "le prochain Non commencé entre dans le groupe. Les nouveaux arrivent classe par classe, puis par ordre alphabétique."
-    )
+    st.caption(" · ".join(active_names))
+    status_metrics(selected_students(active_ids))
 
     session_id = st.session_state.get("session_id")
     session = get_session(session_id) if session_id else None
@@ -346,7 +342,7 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
 
     if not session:
         st.button(
-            "▶️ Commencer l'entraînement",
+            "▶️ Commencer",
             type="primary",
             use_container_width=True,
             on_click=start_training,
@@ -358,11 +354,11 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
         return
 
     if session.get("completed_at"):
-        st.success("Entraînement terminé pour le moment 🎉")
+        st.success("C'est bon pour aujourd'hui 🎉")
         st.session_state.pop("current_student", None)
         st.session_state.pop("answer_revealed", None)
         st.button(
-            "▶️ Chercher une nouvelle série",
+            "▶️ Continuer",
             type="primary",
             use_container_width=True,
             on_click=start_training,
@@ -371,11 +367,7 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
         return
 
     progress = session_progress(session["id"])
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Groupe actif", f"{progress['active']}/10")
-    c2.metric("Finalisés aujourd'hui", progress["completed"])
-    c3.metric("Questions", progress["attempts"])
-    st.progress(min(1.0, progress["active"] / 10.0))
+    st.caption(f"{progress['active']} élève(s) en cours")
 
     feedback = st.session_state.pop("feedback", None)
     if feedback:
@@ -387,21 +379,19 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
 
     student = st.session_state.get("current_student")
     if not student:
-        st.success("Entraînement terminé pour le moment 🎉")
+        st.success("C'est bon pour aujourd'hui 🎉")
         return
 
     left, right = st.columns([1.05, 1])
     with left:
         st.image(student["photo_path"], caption="Qui est cet élève ?", width=420)
         st.caption(
-            f"{student.get('class_name', '')} · {STATUS_LABELS.get(student['status'], student['status'])} · "
-            f"{student.get('correct_count', 0)}/3 réussites dans cette session"
+            f"{student.get('class_name', '')} · {STAGE_LABELS[display_stage(student)]}"
         )
 
     with right:
         if not st.session_state.get("answer_revealed", False):
             st.markdown("## Donne son nom")
-            st.write("Réponds mentalement ou à voix haute, puis vérifie.")
             st.button(
                 "👀 Afficher le nom",
                 type="primary",
@@ -426,13 +416,12 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
                 on_click=answer_current,
                 args=(False,),
             )
-            st.caption("Après Oui/Non, l'élève suivant arrive automatiquement.")
 
     error = st.session_state.pop("friendly_error", None)
     if error:
         st.warning(error)
 
-    if st.button("⏹️ Arrêter cette session"):
+    if st.button("⏹️ Arrêter"):
         end_session(session["id"])
         st.session_state.pop("session_id", None)
         st.session_state.pop("current_student", None)
@@ -442,15 +431,14 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
 
 def page_random(classes: list[dict], active_ids: list[int]) -> None:
     st.title("🎲 Élève au hasard")
-    st.caption("Tirage libre : aucun statut ni progression n'est modifié.")
     if not active_ids:
-        st.info("Coche au moins une classe en haut.")
+        st.info("Sélectionne au moins une classe en haut.")
         return
 
     active_names = [row["name"] for row in classes if int(row["id"]) in active_ids]
-    st.caption("Classes : " + " · ".join(active_names))
+    st.caption(" · ".join(active_names))
     st.button(
-        "🎲 Choisir un élève au hasard",
+        "🎲 Choisir un élève",
         type="primary",
         use_container_width=True,
         on_click=choose_random_student,
@@ -478,7 +466,6 @@ def page_random(classes: list[dict], active_ids: list[int]) -> None:
             )
         else:
             show_answer(student)
-            st.caption("Ce tirage ne compte pas dans l'apprentissage.")
 
 
 def page_manage(classes: list[dict]) -> None:
@@ -491,26 +478,21 @@ def page_manage(classes: list[dict]) -> None:
     class_label = st.selectbox("Classe", list(labels))
     class_id = labels[class_label]
     class_row = next(c for c in classes if int(c["id"]) == class_id)
-    stats = class_stats(class_id)
-    cols = st.columns(4)
-    for col, status in zip(cols, ["non_commence", "vu", "memorise", "acquis"]):
-        col.metric(STATUS_LABELS[status], stats[status])
+    students = get_students(class_id)
+    status_metrics(students)
 
     st.subheader("Élèves")
-    st.caption("Les noms extraits du PDF/OCR sont modifiables. Une correction manuelle devient la référence.")
-    for student in get_students(class_id):
-        title = f"{student['position']:02d} · {student_display_name(student)} · {STATUS_LABELS[student['status']]}"
+    st.caption("Tu peux corriger un prénom ou un nom à tout moment.")
+    for student in students:
+        stage = STAGE_LABELS[display_stage(student)]
+        title = f"{student['position']:02d} · {student_display_name(student)} · {stage}"
         with st.expander(title):
             a, b, c = st.columns([1, 1.2, 1.4])
             with a:
                 st.image(student["photo_path"], width=150)
             with b:
                 if student.get("label_path") and Path(student["label_path"]).exists():
-                    st.image(student["label_path"], caption="Zone du nom dans le PDF", width=340)
-                source = student.get("name_source") or "non lu"
-                st.caption(f"Source du nom : {source}")
-                if student.get("memory_dates"):
-                    st.caption("Cycle courant : " + " · ".join(student["memory_dates"]))
+                    st.image(student["label_path"], caption="Nom sur le trombinoscope", width=340)
             with c:
                 first = st.text_input("Prénom", value=student["first_name"], key=f"fn_{student['id']}")
                 last = st.text_input("Nom", value=student["last_name"], key=f"ln_{student['id']}")
@@ -520,7 +502,7 @@ def page_manage(classes: list[dict]) -> None:
 
     st.divider()
     with st.expander("🗑️ Supprimer cette classe"):
-        st.warning("Cela supprime la classe, son PDF, ses portraits et toute sa progression.")
+        st.warning("Cela supprimera cette classe et toute sa progression.")
         typed = st.text_input(
             f"Pour confirmer, écris exactement : {class_row['name']}",
             key=f"delete_confirm_{class_id}",
@@ -540,8 +522,7 @@ def page_manage(classes: list[dict]) -> None:
 
 def page_backup() -> None:
     st.title("🛟 Sauvegarde & mise à jour")
-    st.subheader("Sauvegarder mes données")
-    st.write("La sauvegarde contient les classes, photos et toute la progression.")
+    st.subheader("Sauvegarder")
     try:
         backup = create_backup_bytes()
         filename = f"FlashTrombi-sauvegarde-{datetime.now():%Y-%m-%d}.zip"
@@ -556,7 +537,7 @@ def page_backup() -> None:
     except Exception:
         st.error("Impossible de préparer la sauvegarde pour le moment.")
 
-    st.subheader("Restaurer une sauvegarde")
+    st.subheader("Restaurer")
     restore_file = st.file_uploader("Choisir une sauvegarde .zip", type=["zip"], key="restore_zip")
     confirm = st.checkbox("Je comprends que la restauration remplacera les données actuelles.")
     if st.button("♻️ Restaurer", disabled=not (restore_file and confirm)):
@@ -572,7 +553,6 @@ def page_backup() -> None:
 
     st.divider()
     st.subheader("Mises à jour")
-    st.caption(f"Version installée : {APP_VERSION}")
     if st.button("🔄 Vérifier les mises à jour"):
         with st.spinner("Vérification…"):
             st.session_state["update_check"] = check_for_update()
@@ -584,11 +564,6 @@ def page_backup() -> None:
         else:
             st.info(result["message"])
 
-    with st.expander("Dépannage"):
-        st.caption("Tes données sont enregistrées ici :")
-        st.code(str(DATA_DIR))
-        st.write("Une mise à jour ou une réinstallation de l'application ne supprime pas ce dossier.")
-
 
 def main() -> None:
     if "nav" not in st.session_state:
@@ -596,10 +571,7 @@ def main() -> None:
 
     with st.sidebar:
         st.markdown("## 🧑‍🏫 Flash Trombi")
-        st.caption(f"v{APP_VERSION}")
         st.radio("Navigation", NAV_ITEMS, key="nav", label_visibility="collapsed")
-        st.divider()
-        st.caption("Données privées stockées uniquement sur cet ordinateur.")
 
     classes = list_classes()
     welcome = st.session_state.pop("welcome_message", None)
@@ -625,8 +597,5 @@ def main() -> None:
 
 try:
     main()
-except Exception as exc:
-    st.error("Flash Trombi a rencontré un problème inattendu.")
-    st.write("Ferme puis relance l'application. Si le problème revient, fais une sauvegarde et conserve le message ci-dessous.")
-    with st.expander("Détails techniques"):
-        st.code(f"{type(exc).__name__}: {exc}")
+except Exception:
+    st.error("Flash Trombi a rencontré un problème. Ferme puis relance l'application.")
