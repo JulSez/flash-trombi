@@ -64,6 +64,38 @@ jobs:
         run: |
           python -m PyInstaller --noconfirm --clean --windowed --name FlashTrombi --add-data "app.py;." --collect-all streamlit --collect-all altair --collect-all rapidocr --collect-all onnxruntime launcher.py
 
+      - name: Smoke-test packaged application
+        shell: pwsh
+        run: |
+          $env:FLASH_TROMBI_PORT = "8765"
+          $env:FLASH_TROMBI_SKIP_BROWSER = "1"
+          $process = Start-Process -FilePath ".\dist\FlashTrombi\FlashTrombi.exe" -PassThru
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 45; $i++) {
+              Start-Sleep -Seconds 1
+              if ($process.HasExited) {
+                throw "FlashTrombi.exe exited during startup with code $($process.ExitCode)."
+              }
+              try {
+                $response = Invoke-WebRequest -Uri "http://127.0.0.1:8765/_stcore/health" -UseBasicParsing -TimeoutSec 2
+                if ($response.StatusCode -eq 200) {
+                  $ready = $true
+                  break
+                }
+              } catch {
+                # Server is still starting.
+              }
+            }
+            if (-not $ready) {
+              throw "FlashTrombi.exe did not become ready within 45 seconds."
+            }
+          } finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+          }
+
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup -y --no-progress
