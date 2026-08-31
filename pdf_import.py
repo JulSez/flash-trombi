@@ -116,34 +116,20 @@ def _cell_label_clip(
     row: List[Dict],
     col_index: int,
     band: fitz.Rect,
+    *,
+    visual_margin: bool = False,
 ) -> fitz.Rect:
     _, ranges = _cell_ranges(page, row)
     left, right = ranges[col_index]
-    # A small margin gives the visual fallback room without reaching the next card.
-    margin = min(5.0, max(0.0, (right - left) * 0.035))
+    margin = 0.0
+    if visual_margin:
+        margin = min(6.0, max(0.0, (right - left) * 0.04))
     return fitz.Rect(
         max(page.rect.x0, left - margin),
         band.y0,
         min(page.rect.x1, right + margin),
         band.y1,
     )
-
-
-def _nearest_index(value: float, centers: Sequence[float]) -> int:
-    return min(range(len(centers)), key=lambda idx: abs(centers[idx] - value))
-
-
-def _assign_cell(
-    x0: float,
-    x1: float,
-    centers: Sequence[float],
-    ranges: Sequence[Tuple[float, float]],
-) -> int:
-    overlaps = [max(0.0, min(x1, right) - max(x0, left)) for left, right in ranges]
-    best = max(overlaps) if overlaps else 0.0
-    if best > 0:
-        return overlaps.index(best)
-    return _nearest_index((x0 + x1) / 2, centers)
 
 
 def _group_fragments_into_lines(
@@ -181,22 +167,18 @@ def _group_fragments_into_lines(
     return lines
 
 
-def _pdf_lines_for_row(
-    page: fitz.Page,
-    band: fitz.Rect,
-    centers: Sequence[float],
-    ranges: Sequence[Tuple[float, float]],
-) -> List[List[str]]:
-    grouped: List[List[Tuple[float, float, float, float, str]]] = [[] for _ in centers]
-    for word in page.get_text("words", clip=band):
+def _pdf_lines_for_cell(page: fitz.Page, clip: fitz.Rect) -> List[str]:
+    fragments: List[Tuple[float, float, float, float, str]] = []
+    for word in page.get_text("words", clip=clip):
         x0, y0, x1, y1, text = word[:5]
         text = str(text).strip()
         if not text:
             continue
-        idx = _assign_cell(float(x0), float(x1), centers, ranges)
-        grouped[idx].append((float(x0), float(y0), float(x1), float(y1), text))
-
-    return [_group_fragments_into_lines(parts) for parts in grouped]
+        center_x = (float(x0) + float(x1)) / 2
+        if not (clip.x0 <= center_x <= clip.x1):
+            continue
+        fragments.append((float(x0), float(y0), float(x1), float(y1), text))
+    return _group_fragments_into_lines(fragments)
 
 
 def _get_ocr_engine():
@@ -215,27 +197,30 @@ def _get_ocr_engine():
         return None
 
 
-def _ocr_lines_for_row(
+def _ocr_lines_for_cell(
     page: fitz.Page,
-    band: fitz.Rect,
-    centers: Sequence[float],
-    ranges: Sequence[Tuple[float, float]],
-    zoom: float = 4.5,
-) -> List[List[str]]:
+    clip: fitz.Rect,
+    zoom: float = 5.0,
+) -> List[str]:
+    """Read one student's label in isolation.
+
+    Reading the whole row at once can make the text detector merge two adjacent
+    labels into a single box. Cropping each card first prevents that failure mode.
+    """
     engine = _get_ocr_engine()
     if engine is None:
-        return [[] for _ in centers]
+        return []
 
     try:
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=band, alpha=False)
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
         result = engine(pix.tobytes("png"))
         txts = getattr(result, "txts", None)
         boxes = getattr(result, "boxes", None)
         scores = getattr(result, "scores", None)
         if txts is None or boxes is None:
-            return [[] for _ in centers]
+            return []
 
-        grouped: List[List[Tuple[float, float, float, float, str]]] = [[] for _ in centers]
+        fragments: List[Tuple[float, float, float, float, str]] = []
         for index, text in enumerate(txts):
             text = str(text).strip()
             if not text:
@@ -244,28 +229,49 @@ def _ocr_lines_for_row(
                 continue
 
             box = boxes[index]
-            xs = [float(point[0]) for point in box]
-            ys = [float(point[1]) for point in box]
-            x0 = band.x0 + min(xs) / zoom
-            x1 = band.x0 + max(xs) / zoom
-            y0 = band.y0 + min(ys) / zoom
-            y1 = band.y0 + max(ys) / zoom
-            idx = _assign_cell(x0, x1, centers, ranges)
-            grouped[idx].append((x0, y0, x1, y1, text))
+            xs = [float(point[0]) / zoom for point in box]
+            ys = [float(point[1]) / zoom for point in box]
+            fragments.append((min(xs), min(ys), max(xs), max(ys), text))
 
-        return [_group_fragments_into_lines(parts) for parts in grouped]
+        return _group_fragments_into_lines(fragments)
     except Exception:
-        return [[] for _ in centers]
+        return []
 
 
-def _clean_name_text(value: str) -> str:
-    value = re.sub(r"\s+", " ", value or "").strip(" -–—|,;:")
-    value = re.sub(r"^[^A-Za-zÀ-ÖØ-öø-ÿ]+|[^A-Za-zÀ-ÖØ-öø-ÿ'’\- ]+$", "", value)
+def _clean_name_line(value: str) -> str:
+    value = re.sub(r"\s+", " ", value or "").strip(" \t|,;:–—")
+    value = re.sub(r"^[^A-Za-zÀ-ÖØ-öø-ÿ]+", "", value)
+    value = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ'’\-]+$", "", value)
     return re.sub(r"\s+", " ", value).strip()
 
 
 def _clean_lines(lines: Sequence[str]) -> List[str]:
-    return [cleaned for cleaned in (_clean_name_text(line) for line in lines) if cleaned]
+    return [cleaned for cleaned in (_clean_name_line(line) for line in lines) if cleaned]
+
+
+def _join_name_lines(lines: Sequence[str]) -> str:
+    cleaned = _clean_lines(lines)
+    if not cleaned:
+        return ""
+
+    result = cleaned[0]
+    for line in cleaned[1:]:
+        if result.endswith("-"):
+            result += line.lstrip("- ")
+        else:
+            result += " " + line
+
+    result = re.sub(r"\s+", " ", result).strip()
+    if result.endswith("-"):
+        result = result[:-1].rstrip()
+    return result
+
+
+def _clean_name_text(value: str) -> str:
+    value = re.sub(r"\s+", " ", value or "").strip(" \t|,;:–—")
+    value = re.sub(r"^[^A-Za-zÀ-ÖØ-öø-ÿ]+", "", value)
+    value = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ'’\- ]+$", "", value)
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def _is_upper_name_token(token: str) -> bool:
@@ -278,22 +284,9 @@ def _name_case(value: str) -> str:
 
 
 def split_pronote_name(value: str, lines: Sequence[str] | None = None) -> Tuple[str, str]:
-    """Return (first_name, last_name) while preserving Pronote label structure."""
-    cleaned_lines = _clean_lines(lines or [])
-
-    # On printed trombinoscopes Pronote commonly places the family name on the
-    # first visual line and the given name(s) below. Keeping that line break is
-    # much more reliable than guessing from word count, especially for compound
-    # family names or multiple given names.
-    if len(cleaned_lines) >= 2:
-        top_tokens = cleaned_lines[0].split()
-        if top_tokens and all(_is_upper_name_token(token) for token in top_tokens):
-            surname = cleaned_lines[0]
-            first = " ".join(cleaned_lines[1:])
-            if first:
-                return _name_case(first), _name_case(surname)
-
-    text = _clean_name_text(value or " ".join(cleaned_lines))
+    """Return (first_name, last_name) from a Pronote-style label."""
+    joined = _join_name_lines(lines or [])
+    text = _clean_name_text(joined or value)
     tokens = text.split()
     if not tokens:
         return "", ""
@@ -311,8 +304,9 @@ def split_pronote_name(value: str, lines: Sequence[str] | None = None) -> Tuple[
     if surname and first:
         return _name_case(" ".join(first)), _name_case(" ".join(surname))
 
-    # With no reliable case or line break, avoid inventing a compound surname.
-    # The first token remains the safest fallback and is editable in the UI.
+    # If case information was lost during recognition, Pronote still places the
+    # family name first. Use only that reliable ordering rather than guessing a
+    # multi-word surname from neighbouring labels.
     if len(tokens) >= 2:
         return _name_case(" ".join(tokens[1:])), _name_case(tokens[0])
     return "", _name_case(tokens[0])
@@ -339,22 +333,41 @@ def extract_cards(pdf_bytes: bytes) -> List[Dict]:
 
         for row_index, row in enumerate(rows):
             band = _row_label_band(page, rows, row_index)
-            centers, ranges = _cell_ranges(page, row)
-            pdf_lines = _pdf_lines_for_row(page, band, centers, ranges)
-            need_ocr = [not _clean_lines(lines) for lines in pdf_lines]
-            ocr_lines = [[] for _ in row]
-            if any(need_ocr):
-                ocr_lines = _ocr_lines_for_row(page, band, centers, ranges)
 
             for col_index, item in enumerate(row):
                 global_index += 1
                 block = item["block"]
-                clip = _cell_label_clip(page, row, col_index, band)
-                label_pix = page.get_pixmap(matrix=fitz.Matrix(3.5, 3.5), clip=clip, alpha=False)
 
-                lines, source = _best_name_lines(pdf_lines[col_index], ocr_lines[col_index])
-                name_text = _clean_name_text(" ".join(lines))
+                # Important: read each label in its own non-overlapping cell.
+                # This prevents a long label from being merged with the next one.
+                read_clip = _cell_label_clip(
+                    page,
+                    row,
+                    col_index,
+                    band,
+                    visual_margin=False,
+                )
+                pdf_lines = _pdf_lines_for_cell(page, read_clip)
+                ocr_lines: List[str] = []
+                if not _clean_lines(pdf_lines):
+                    ocr_lines = _ocr_lines_for_cell(page, read_clip)
+
+                lines, source = _best_name_lines(pdf_lines, ocr_lines)
+                name_text = _clean_name_text(_join_name_lines(lines))
                 first_name, last_name = split_pronote_name(name_text, lines)
+
+                visual_clip = _cell_label_clip(
+                    page,
+                    row,
+                    col_index,
+                    band,
+                    visual_margin=True,
+                )
+                label_pix = page.get_pixmap(
+                    matrix=fitz.Matrix(3.5, 3.5),
+                    clip=visual_clip,
+                    alpha=False,
+                )
 
                 cards.append(
                     {
