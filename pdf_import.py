@@ -127,6 +127,8 @@ def _cell_label_clip(
     row: List[Dict],
     col_index: int,
     band: fitz.Rect,
+    *,
+    visual_margin: bool = False,
 ) -> fitz.Rect:
     _, ranges = _cell_ranges(page, row)
     left, right = ranges[col_index]
@@ -266,16 +268,40 @@ def _ocr_lines_for_cell(
         return []
 
 
-def _clean_name_text(value: str) -> str:
-    value = (value or "").replace("‐", "-").replace("‑", "-").replace("‒", "-").replace("–", "-").replace("—", "-")
-    value = re.sub(r"\s+", " ", value).strip(" \t\r\n|,;:")
+def _clean_name_line(value: str) -> str:
+    value = re.sub(r"\s+", " ", value or "").strip(" \t|,;:–—")
     value = re.sub(r"^[^A-Za-zÀ-ÖØ-öø-ÿ]+", "", value)
-    value = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ'’\- ]+$", "", value)
+    value = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ'’\-]+$", "", value)
     return re.sub(r"\s+", " ", value).strip()
 
 
 def _clean_lines(lines: Sequence[str]) -> List[str]:
-    return [cleaned for cleaned in (_clean_name_text(line) for line in lines) if cleaned]
+    return [cleaned for cleaned in (_clean_name_line(line) for line in lines) if cleaned]
+
+
+def _join_name_lines(lines: Sequence[str]) -> str:
+    cleaned = _clean_lines(lines)
+    if not cleaned:
+        return ""
+
+    result = cleaned[0]
+    for line in cleaned[1:]:
+        if result.endswith("-"):
+            result += line.lstrip("- ")
+        else:
+            result += " " + line
+
+    result = re.sub(r"\s+", " ", result).strip()
+    if result.endswith("-"):
+        result = result[:-1].rstrip()
+    return result
+
+
+def _clean_name_text(value: str) -> str:
+    value = re.sub(r"\s+", " ", value or "").strip(" \t|,;:–—")
+    value = re.sub(r"^[^A-Za-zÀ-ÖØ-öø-ÿ]+", "", value)
+    value = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ'’\- ]+$", "", value)
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def _is_upper_name_token(token: str) -> bool:
@@ -361,24 +387,36 @@ def extract_cards(pdf_bytes: bytes) -> List[Dict]:
                 global_index += 1
                 block = item["block"]
 
-                # Important: crop the individual card BEFORE text recognition.
-                # This prevents a neighbouring name from ever being returned in
-                # the same recognition result.
-                clip = _cell_label_clip(page, row, col_index, band)
-                pdf_lines = _pdf_lines_for_cell(page, clip)
+                # Important: read each label in its own non-overlapping cell.
+                # This prevents a long label from being merged with the next one.
+                read_clip = _cell_label_clip(
+                    page,
+                    row,
+                    col_index,
+                    band,
+                    visual_margin=False,
+                )
+                pdf_lines = _pdf_lines_for_cell(page, read_clip)
                 ocr_lines: List[str] = []
                 if not _clean_lines(pdf_lines):
-                    ocr_lines = _ocr_lines_for_cell(page, clip)
-
-                label_pix = page.get_pixmap(
-                    matrix=fitz.Matrix(3.5, 3.5),
-                    clip=clip,
-                    alpha=False,
-                )
+                    ocr_lines = _ocr_lines_for_cell(page, read_clip)
 
                 lines, source = _best_name_lines(pdf_lines, ocr_lines)
-                name_text = _clean_name_text(" ".join(lines))
+                name_text = _clean_name_text(_join_name_lines(lines))
                 first_name, last_name = split_pronote_name(name_text, lines)
+
+                visual_clip = _cell_label_clip(
+                    page,
+                    row,
+                    col_index,
+                    band,
+                    visual_margin=True,
+                )
+                label_pix = page.get_pixmap(
+                    matrix=fitz.Matrix(3.5, 3.5),
+                    clip=visual_clip,
+                    alpha=False,
+                )
 
                 cards.append(
                     {

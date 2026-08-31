@@ -144,7 +144,8 @@ def init_db() -> None:
                 session_date TEXT NOT NULL,
                 started_at TEXT NOT NULL,
                 completed_at TEXT,
-                maintenance_mode INTEGER NOT NULL DEFAULT 0
+                maintenance_mode INTEGER NOT NULL DEFAULT 0,
+                memorised_review_mode INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS session_students (
@@ -153,6 +154,8 @@ def init_db() -> None:
                 initial_status TEXT NOT NULL,
                 correct_count INTEGER NOT NULL DEFAULT 0,
                 completed INTEGER NOT NULL DEFAULT 0,
+                review_first_done INTEGER NOT NULL DEFAULT 0,
+                review_failed INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(session_id, student_id)
             );
 
@@ -167,6 +170,9 @@ def init_db() -> None:
         )
         _ensure_column(conn, "students", "name_source", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "sessions", "class_scope", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "sessions", "memorised_review_mode", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "session_students", "review_first_done", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "session_students", "review_failed", "INTEGER NOT NULL DEFAULT 0")
 
 
 def class_name_exists(name: str) -> bool:
@@ -488,6 +494,26 @@ def _eligible_rows(
     return memorised_due, seen, not_started, acquired
 
 
+def _all_memorised_rows(
+    conn: sqlite3.Connection,
+    class_ids: Sequence[int],
+) -> List[sqlite3.Row]:
+    if not class_ids:
+        return []
+    placeholders = ",".join("?" for _ in class_ids)
+    rows = conn.execute(
+        f"""
+        SELECT s.*, c.name AS class_name
+        FROM students s JOIN classes c ON c.id=s.class_id
+        WHERE s.class_id IN ({placeholders}) AND s.status=?
+        """,
+        [*class_ids, STATUS_MEMORISE],
+    ).fetchall()
+    result = list(rows)
+    random.shuffle(result)
+    return result
+
+
 def _add_student_to_session(
     conn: sqlite3.Connection, session_id: int, student: sqlite3.Row
 ) -> None:
@@ -508,6 +534,8 @@ def _replenish_session(
 ) -> int:
     session = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
     if not session:
+        return 0
+    if int(session["memorised_review_mode"]):
         return 0
     class_ids = _session_class_ids(session)
     added = 0
@@ -571,19 +599,29 @@ def start_or_resume_session(
 
         cursor = conn.execute(
             """
-            INSERT INTO sessions(class_id, class_scope, session_date, started_at, maintenance_mode)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO sessions(
+                class_id, class_scope, session_date, started_at,
+                maintenance_mode, memorised_review_mode
+            ) VALUES (?, ?, ?, ?, ?, 0)
             """,
             (ids[0], _scope_key(ids), today, _now(), maintenance),
         )
         session_id = int(cursor.lastrowid)
         _replenish_session(conn, session_id, today)
 
+        if _active_count(conn, session_id) == 0 and not maintenance:
+            memorised = _all_memorised_rows(conn, ids)
+            if memorised:
+                conn.execute(
+                    "UPDATE sessions SET memorised_review_mode=1 WHERE id=?",
+                    (session_id,),
+                )
+                for student in memorised[:10]:
+                    _add_student_to_session(conn, session_id, student)
+
         if _active_count(conn, session_id) == 0:
             conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
-            raise ValueError(
-                "Rien à travailler aujourd'hui : les élèves à réviser ont déjà été faits."
-            )
+            raise ValueError("Rien à travailler aujourd'hui.")
         return dict(conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone())
 
 
@@ -602,7 +640,8 @@ def get_session_students(session_id: int) -> List[Dict]:
         rows = conn.execute(
             """
             SELECT s.*, c.name AS class_name,
-                   ss.correct_count, ss.completed, ss.initial_status
+                   ss.correct_count, ss.completed, ss.initial_status,
+                   ss.review_first_done, ss.review_failed
             FROM session_students ss
             JOIN students s ON s.id=ss.student_id
             JOIN classes c ON c.id=s.class_id
@@ -617,16 +656,46 @@ def get_session_students(session_id: int) -> List[Dict]:
 
 def next_student(session_id: int) -> Optional[Dict]:
     with connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT s.*, c.name AS class_name, ss.correct_count, ss.completed
-            FROM session_students ss
-            JOIN students s ON s.id=ss.student_id
-            JOIN classes c ON c.id=s.class_id
-            WHERE ss.session_id=? AND ss.completed=0
-            """,
-            (session_id,),
-        ).fetchall()
+        session = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+        if not session:
+            return None
+
+        if int(session["memorised_review_mode"]):
+            rows = conn.execute(
+                """
+                SELECT s.*, c.name AS class_name, ss.correct_count, ss.completed,
+                       ss.review_first_done, ss.review_failed
+                FROM session_students ss
+                JOIN students s ON s.id=ss.student_id
+                JOIN classes c ON c.id=s.class_id
+                WHERE ss.session_id=? AND ss.completed=0 AND ss.review_first_done=0
+                """,
+                (session_id,),
+            ).fetchall()
+            if not rows:
+                rows = conn.execute(
+                    """
+                    SELECT s.*, c.name AS class_name, ss.correct_count, ss.completed,
+                           ss.review_first_done, ss.review_failed
+                    FROM session_students ss
+                    JOIN students s ON s.id=ss.student_id
+                    JOIN classes c ON c.id=s.class_id
+                    WHERE ss.session_id=? AND ss.completed=0 AND ss.review_failed=1
+                    """,
+                    (session_id,),
+                ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT s.*, c.name AS class_name, ss.correct_count, ss.completed
+                FROM session_students ss
+                JOIN students s ON s.id=ss.student_id
+                JOIN classes c ON c.id=s.class_id
+                WHERE ss.session_id=? AND ss.completed=0
+                """,
+                (session_id,),
+            ).fetchall()
+
         if not rows:
             return None
 
@@ -700,7 +769,49 @@ def record_answer(
         became_memorised_today = False
         message = ""
 
-        if int(session["maintenance_mode"]):
+        if int(session["memorised_review_mode"]):
+            first_done = bool(ss["review_first_done"])
+            if not first_done:
+                conn.execute(
+                    "UPDATE session_students SET review_first_done=1 WHERE session_id=? AND student_id=?",
+                    (session_id, student_id),
+                )
+                if correct:
+                    completed = 1
+                    message = "Bien vu 👍"
+                else:
+                    conn.execute(
+                        "UPDATE session_students SET review_failed=1 WHERE session_id=? AND student_id=?",
+                        (session_id, student_id),
+                    )
+                    message = "On le reverra à la fin."
+            else:
+                if correct:
+                    completed = 1
+                    conn.execute(
+                        "UPDATE session_students SET review_failed=0 WHERE session_id=? AND student_id=?",
+                        (session_id, student_id),
+                    )
+                    message = "Rattrapé 👍"
+                else:
+                    new_cycle = int(student["cycle_no"]) + 1
+                    conn.execute(
+                        "UPDATE students SET status=?, cycle_no=? WHERE id=?",
+                        (STATUS_VU, new_cycle, student_id),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE session_students
+                        SET correct_count=0, review_failed=0
+                        WHERE session_id=? AND student_id=?
+                        """,
+                        (session_id, student_id),
+                    )
+                    correct_count = 0
+                    completed = 1
+                    message = "À retravailler : retour à Vu."
+
+        elif int(session["maintenance_mode"]):
             if correct:
                 completed = 1
                 message = "Toujours acquis 👍"
@@ -782,12 +893,13 @@ def record_answer(
                 (session_id, student_id),
             )
 
-        _replenish_session(
-            conn,
-            session_id,
-            today,
-            prefer_non_started=became_memorised_today,
-        )
+        if not int(session["memorised_review_mode"]):
+            _replenish_session(
+                conn,
+                session_id,
+                today,
+                prefer_non_started=became_memorised_today,
+            )
 
         refreshed = conn.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
         dates = memory_dates(conn, student_id, int(refreshed["cycle_no"]))
@@ -808,7 +920,9 @@ def session_progress(session_id: int) -> Dict[str, int]:
             """
             SELECT COUNT(*) AS introduced,
                    SUM(CASE WHEN completed=1 THEN 1 ELSE 0 END) AS completed,
-                   SUM(CASE WHEN completed=0 THEN 1 ELSE 0 END) AS active
+                   SUM(CASE WHEN completed=0 THEN 1 ELSE 0 END) AS active,
+                   SUM(CASE WHEN review_first_done=1 THEN 1 ELSE 0 END) AS review_first_done,
+                   SUM(CASE WHEN review_failed=1 AND completed=0 THEN 1 ELSE 0 END) AS review_failed
             FROM session_students WHERE session_id=?
             """,
             (session_id,),
@@ -822,6 +936,8 @@ def session_progress(session_id: int) -> Dict[str, int]:
             "completed": int(row["completed"] or 0),
             "active": int(row["active"] or 0),
             "attempts": int(attempts or 0),
+            "review_first_done": int(row["review_first_done"] or 0),
+            "review_failed": int(row["review_failed"] or 0),
         }
 
 
