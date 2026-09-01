@@ -1,5 +1,5 @@
 #define MyAppName "Flash Trombi"
-#define MyAppVersion "0.6.1"
+#define MyAppVersion "0.6.2"
 #define MyAppPublisher "Flash Trombi"
 #define MyAppExeName "FlashTrombi.exe"
 
@@ -13,7 +13,7 @@ DefaultGroupName={#MyAppName}
 PrivilegesRequired=lowest
 DisableProgramGroupPage=yes
 OutputDir=..\installer-output
-OutputBaseFilename=FlashTrombi-Setup
+OutputBaseFilename=FlashTrombi_v{#MyAppVersion}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

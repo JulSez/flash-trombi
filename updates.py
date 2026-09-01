@@ -19,6 +19,25 @@ def _version_tuple(value: str) -> Tuple[int, ...]:
     return tuple(int(part) for part in match.group(1).split("."))
 
 
+def _installer_download_url(payload: dict, tag: str) -> Optional[str]:
+    version = tag.lstrip("v")
+    preferred = f"FlashTrombi_v{version}.exe".casefold()
+    exe_assets = []
+
+    for asset in payload.get("assets") or []:
+        name = str(asset.get("name") or "")
+        url = str(asset.get("browser_download_url") or "")
+        if not name or not url or not name.casefold().endswith(".exe"):
+            continue
+        if name.casefold() == preferred:
+            return url
+        exe_assets.append((name, url))
+
+    if exe_assets:
+        return exe_assets[0][1]
+    return None
+
+
 def check_for_update(timeout: float = 4.0) -> Dict[str, Optional[str]]:
     request = urllib.request.Request(
         LATEST_RELEASE_API,
@@ -34,6 +53,7 @@ def check_for_update(timeout: float = 4.0) -> Dict[str, Optional[str]]:
                 "current": APP_VERSION,
                 "latest": None,
                 "url": RELEASES_URL,
+                "download_url": None,
                 "message": "Aucune version Windows publiée pour le moment.",
             }
         return {
@@ -41,6 +61,7 @@ def check_for_update(timeout: float = 4.0) -> Dict[str, Optional[str]]:
             "current": APP_VERSION,
             "latest": None,
             "url": RELEASES_URL,
+            "download_url": None,
             "message": "Impossible de vérifier les mises à jour maintenant.",
         }
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
@@ -49,6 +70,7 @@ def check_for_update(timeout: float = 4.0) -> Dict[str, Optional[str]]:
             "current": APP_VERSION,
             "latest": None,
             "url": RELEASES_URL,
+            "download_url": None,
             "message": "Pas de connexion à GitHub. Réessaie plus tard.",
         }
 
@@ -60,6 +82,7 @@ def check_for_update(timeout: float = 4.0) -> Dict[str, Optional[str]]:
         "current": APP_VERSION,
         "latest": tag or None,
         "url": url,
+        "download_url": _installer_download_url(payload, tag) if available else None,
         "message": (
             f"Une nouvelle version ({tag}) est disponible."
             if available
