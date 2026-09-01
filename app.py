@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import streamlit as st
@@ -11,7 +11,14 @@ from practice_mode import (
     current_practice_student,
     only_memorised_remain,
 )
-from progress_view import STAGE_LABELS, STAGE_ORDER, display_stage, mastery_ratio, stage_counts
+from progress_view import (
+    STAGE_LABELS,
+    STAGE_ORDER,
+    daily_completion_ratio,
+    display_stage,
+    mastery_ratio,
+    stage_counts,
+)
 from storage import (
     analyze_pdf,
     class_name_exists,
@@ -51,6 +58,9 @@ NAV_MANAGE = "🛠️ Gérer les classes"
 NAV_BACKUP = "🛟 Sauvegarde & mise à jour"
 NAV_ITEMS = [NAV_HOME, NAV_TRAIN, NAV_RANDOM, NAV_ADD, NAV_MANAGE, NAV_BACKUP]
 
+MAIN_PHOTO_WIDTH = 357
+MEMORISED_TOAST = "3 réussites : l'élève est mémorisé"
+
 
 def student_display_name(student: dict) -> str:
     name = " ".join(
@@ -79,17 +89,15 @@ def go_to(page: str) -> None:
         st.session_state.pop("answer_revealed", None)
 
 
-def go_training(class_id: int) -> None:
-    for key in list(st.session_state):
-        if key.startswith("active_class_"):
-            st.session_state[key] = False
-    st.session_state[f"active_class_{class_id}"] = True
+def go_training(class_id: int, class_name: str) -> None:
+    st.session_state["multi_class_mode"] = False
+    st.session_state["class_radio"] = class_name
     st.session_state["nav"] = NAV_TRAIN
     st.session_state.pop("session_id", None)
     st.session_state.pop("practice_session", None)
     st.session_state.pop("current_student", None)
     st.session_state.pop("answer_revealed", None)
-    st.session_state.pop("feedback", None)
+    st.session_state.pop("memorised_toast", None)
 
 
 def selected_students(class_ids: list[int]) -> list[dict]:
@@ -107,7 +115,6 @@ def _start_memorised_practice(class_ids: list[int], students: list[dict]) -> boo
     st.session_state.pop("session_id", None)
     st.session_state.pop("current_student", None)
     st.session_state["answer_revealed"] = False
-    st.session_state.pop("feedback", None)
     return True
 
 
@@ -118,7 +125,6 @@ def start_training(class_ids: list[int]) -> None:
         st.session_state.pop("practice_session", None)
         st.session_state.pop("current_student", None)
         st.session_state["answer_revealed"] = False
-        st.session_state.pop("feedback", None)
     except Exception as exc:
         students = selected_students(class_ids)
         if "Rien à travailler aujourd'hui" in str(exc) and _start_memorised_practice(class_ids, students):
@@ -130,10 +136,6 @@ def reveal_answer() -> None:
     st.session_state["answer_revealed"] = True
 
 
-def reveal_random_answer() -> None:
-    st.session_state["random_revealed"] = True
-
-
 def answer_current(correct: bool) -> None:
     session_id = st.session_state.get("session_id")
     student = st.session_state.get("current_student")
@@ -141,7 +143,8 @@ def answer_current(correct: bool) -> None:
         return
     try:
         result = record_answer(session_id, student["id"], correct)
-        st.session_state["feedback"] = result["message"]
+        if result.get("message") == "Mémorisé pour aujourd'hui ✅":
+            st.session_state["memorised_toast"] = True
         st.session_state["answer_revealed"] = False
         if result["session_finished"]:
             st.session_state.pop("current_student", None)
@@ -155,16 +158,14 @@ def answer_practice_current(correct: bool) -> None:
     practice = st.session_state.get("practice_session")
     if not practice:
         return
-    result = answer_practice(practice, correct)
+    answer_practice(practice, correct)
     st.session_state["practice_session"] = practice
-    st.session_state["feedback"] = result["message"]
     st.session_state["answer_revealed"] = False
 
 
 def stop_practice() -> None:
     st.session_state.pop("practice_session", None)
     st.session_state.pop("answer_revealed", None)
-    st.session_state.pop("feedback", None)
 
 
 def choose_random_student(class_ids: list[int]) -> None:
@@ -176,7 +177,6 @@ def choose_random_student(class_ids: list[int]) -> None:
     st.session_state["random_student"] = student
     recent.append(int(student["id"]))
     st.session_state["random_recent"] = recent[-5:]
-    st.session_state["random_revealed"] = False
 
 
 def clear_analysis() -> None:
@@ -188,7 +188,7 @@ def clear_analysis() -> None:
 
 def delete_class_and_go_home(class_id: int) -> None:
     delete_class(class_id)
-    st.session_state.pop(f"active_class_{class_id}", None)
+    st.session_state.pop(f"multi_class_{class_id}", None)
     st.session_state.pop("session_id", None)
     st.session_state.pop("practice_session", None)
     st.session_state.pop("current_student", None)
@@ -196,33 +196,52 @@ def delete_class_and_go_home(class_id: int) -> None:
     st.session_state["nav"] = NAV_HOME
 
 
-def active_class_selector(classes: list[dict]) -> list[int]:
+def sidebar_class_selector(classes: list[dict]) -> list[int]:
     if not classes:
         return []
 
-    with st.container(border=True):
-        st.markdown("**Classes sélectionnées**")
-        columns = st.columns(min(5, max(1, len(classes))))
-        active: list[int] = []
+    names = [str(row["name"]) for row in classes]
+    ids_by_name = {str(row["name"]): int(row["id"]) for row in classes}
 
-        for index, class_row in enumerate(classes):
-            class_id = int(class_row["id"])
-            key = f"active_class_{class_id}"
-            if key not in st.session_state:
-                st.session_state[key] = True
-            with columns[index % len(columns)]:
-                st.markdown(f"**{class_row['name']}**")
-                checked = st.checkbox(
-                    "Sélectionner",
-                    key=key,
-                    label_visibility="collapsed",
-                )
-            if checked:
-                active.append(class_id)
+    st.markdown("### Classes")
+    multi = st.toggle("Choisir plusieurs classes", key="multi_class_mode")
 
-        if not active:
-            st.warning("Sélectionne au moins une classe.")
-        return active
+    if not multi:
+        current = st.session_state.get("class_radio")
+        if current not in names:
+            st.session_state["class_radio"] = names[0]
+        selected_name = st.radio(
+            "Classe",
+            names,
+            key="class_radio",
+            label_visibility="collapsed",
+        )
+        return [ids_by_name[selected_name]]
+
+    active: list[int] = []
+    current_single = st.session_state.get("class_radio")
+    for row in classes:
+        class_id = int(row["id"])
+        key = f"multi_class_{class_id}"
+        if key not in st.session_state:
+            st.session_state[key] = str(row["name"]) == current_single
+        if st.checkbox(str(row["name"]), key=key):
+            active.append(class_id)
+
+    if not active:
+        st.caption("Choisis au moins une classe.")
+    return active
+
+
+def sidebar_day_progress(active_ids: list[int]) -> None:
+    if not active_ids:
+        return
+    students = selected_students(active_ids)
+    ratio = daily_completion_ratio(students)
+    st.markdown("### Aujourd'hui")
+    st.progress(ratio)
+    done = round(ratio * len(students))
+    st.caption(f"{done}/{len(students)} mémorisé(s) ou acquis")
 
 
 def status_metrics(students: list[dict]) -> None:
@@ -270,7 +289,7 @@ def page_home(classes: list[dict]) -> None:
                     type="primary",
                     use_container_width=True,
                     on_click=go_training,
-                    args=(class_id,),
+                    args=(class_id, str(class_row["name"])),
                 )
 
     st.button("➕ Ajouter une classe", on_click=go_to, args=(NAV_ADD,))
@@ -308,7 +327,10 @@ def page_add_class() -> None:
                     }
                     st.rerun()
             except Exception:
-                st.error("Je n'ai pas réussi à lire ce PDF. Essaie de l'imprimer de nouveau en PDF puis réimporte-le.")
+                st.error(
+                    "Je n'ai pas réussi à lire ce PDF. "
+                    "Essaie de l'imprimer de nouveau en PDF puis réimporte-le."
+                )
 
     analysis = st.session_state.get("pdf_analysis")
     if not analysis:
@@ -347,13 +369,14 @@ def page_add_class() -> None:
         ):
             try:
                 with st.spinner("Création de la classe…"):
-                    class_id = create_class_from_cards(
+                    create_class_from_cards(
                         analysis["class_name"], analysis["pdf_bytes"], selected_cards
                     )
+                created_name = str(analysis["class_name"])
                 clear_analysis()
-                st.session_state[f"active_class_{class_id}"] = True
+                st.session_state["multi_class_mode"] = False
+                st.session_state["class_radio"] = created_name
                 st.session_state["pending_nav"] = NAV_HOME
-                st.session_state["welcome_message"] = "Classe créée."
                 st.rerun()
             except Exception:
                 st.error("La classe n'a pas pu être créée. Réessaie une fois.")
@@ -371,10 +394,6 @@ def render_practice(active_ids: list[int]) -> bool:
     if sorted(practice.get("class_ids", [])) != sorted(active_ids):
         stop_practice()
         return False
-
-    feedback = st.session_state.pop("feedback", None)
-    if feedback:
-        st.toast(feedback)
 
     if practice.get("completed"):
         st.success("Série terminée 🎉")
@@ -402,7 +421,7 @@ def render_practice(active_ids: list[int]) -> bool:
 
     left, right = st.columns([1.05, 1])
     with left:
-        st.image(student["photo_path"], caption="Qui est cet élève ?", width=420)
+        st.image(student["photo_path"], caption="Qui est cet élève ?", width=MAIN_PHOTO_WIDTH)
         st.caption(f"{student.get('class_name', '')} · Mémorisé")
 
     with right:
@@ -446,12 +465,15 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
         st.info("Ajoute d'abord une classe.")
         return
     if not active_ids:
-        st.info("Sélectionne au moins une classe en haut.")
+        st.info("Choisis au moins une classe dans la barre de gauche.")
         return
 
     active_names = [row["name"] for row in classes if int(row["id"]) in active_ids]
     st.caption(" · ".join(active_names))
     status_metrics(selected_students(active_ids))
+
+    if st.session_state.pop("memorised_toast", False):
+        st.toast(MEMORISED_TOAST)
 
     if render_practice(active_ids):
         return
@@ -498,10 +520,6 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
     progress = session_progress(session["id"])
     st.caption(f"{progress['active']} élève(s) en cours")
 
-    feedback = st.session_state.pop("feedback", None)
-    if feedback:
-        st.toast(feedback)
-
     if "current_student" not in st.session_state or st.session_state.get("current_student") is None:
         st.session_state["current_student"] = next_student(session["id"])
         st.session_state["answer_revealed"] = False
@@ -513,10 +531,8 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
 
     left, right = st.columns([1.05, 1])
     with left:
-        st.image(student["photo_path"], caption="Qui est cet élève ?", width=420)
-        st.caption(
-            f"{student.get('class_name', '')} · {STAGE_LABELS[display_stage(student)]}"
-        )
+        st.image(student["photo_path"], caption="Qui est cet élève ?", width=MAIN_PHOTO_WIDTH)
+        st.caption(f"{student.get('class_name', '')} · {STAGE_LABELS[display_stage(student)]}")
 
     with right:
         if not st.session_state.get("answer_revealed", False):
@@ -560,14 +576,15 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
 
 def page_random(classes: list[dict], active_ids: list[int]) -> None:
     st.title("🎲 Élève au hasard")
+    st.caption("Pour désigner un élève au tableau ou choisir qui interroger.")
     if not active_ids:
-        st.info("Sélectionne au moins une classe en haut.")
+        st.info("Choisis au moins une classe dans la barre de gauche.")
         return
 
     active_names = [row["name"] for row in classes if int(row["id"]) in active_ids]
     st.caption(" · ".join(active_names))
     st.button(
-        "🎲 Choisir un élève",
+        "🎲 Tirer un élève",
         type="primary",
         use_container_width=True,
         on_click=choose_random_student,
@@ -581,20 +598,20 @@ def page_random(classes: list[dict], active_ids: list[int]) -> None:
     if not student:
         return
 
-    left, right = st.columns([1.05, 1])
+    left, right = st.columns([1, 1.2])
     with left:
-        st.image(student["photo_path"], caption="Qui est cet élève ?", width=420)
-        st.caption(student.get("class_name", ""))
+        st.image(student["photo_path"], width=MAIN_PHOTO_WIDTH)
     with right:
-        if not st.session_state.get("random_revealed", False):
-            st.button(
-                "👀 Afficher le nom",
-                type="primary",
-                use_container_width=True,
-                on_click=reveal_random_answer,
-            )
-        else:
-            show_answer(student)
+        st.markdown("## Élève désigné")
+        st.markdown(f"# {student_display_name(student)}")
+        st.caption(student.get("class_name", ""))
+        st.button(
+            "🎲 Tirer quelqu'un d'autre",
+            use_container_width=True,
+            on_click=choose_random_student,
+            args=(list(active_ids),),
+            key="random_again",
+        )
 
 
 def page_manage(classes: list[dict]) -> None:
@@ -699,16 +716,19 @@ def main() -> None:
     if "nav" not in st.session_state:
         st.session_state["nav"] = NAV_HOME
 
+    classes = list_classes()
+
     with st.sidebar:
         st.markdown("## 🧑‍🏫 Flash Trombi")
         st.radio("Navigation", NAV_ITEMS, key="nav", label_visibility="collapsed")
+        if classes:
+            st.divider()
+            active_ids = sidebar_class_selector(classes)
+            st.divider()
+            sidebar_day_progress(active_ids)
+        else:
+            active_ids = []
 
-    classes = list_classes()
-    welcome = st.session_state.pop("welcome_message", None)
-    if welcome:
-        st.toast(welcome)
-
-    active_ids = active_class_selector(classes) if classes else []
     nav = st.session_state["nav"]
 
     if nav == NAV_HOME:
