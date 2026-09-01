@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Dict, Sequence
 
+import storage
 from storage import STATUS_MEMORISE, STATUS_VU, connect
 
 
@@ -31,6 +32,7 @@ def memorised_count(students: Sequence[dict]) -> int:
 
 
 def start_shortlist_session(class_ids: Sequence[int], on_date: date | None = None) -> Dict:
+    """Create a review session containing every memorised student in the selection."""
     ids = sorted({int(value) for value in class_ids})
     if not ids:
         raise ValueError("Choisis au moins une classe.")
@@ -72,8 +74,42 @@ def start_shortlist_session(class_ids: Sequence[int], on_date: date | None = Non
         return dict(session)
 
 
-def record_shortlist_answer(session_id: int, student_id: int, correct: bool) -> Dict:
-    """Remove one memorised student from the shortlist; a miss sends them back to Vu."""
+def _session_class_ids(session: dict) -> list[int]:
+    scope = str(session.get("class_scope") or "").strip()
+    if scope:
+        return [int(part) for part in scope.split(",") if part.strip()]
+    return [int(session["class_id"])]
+
+
+def _expand_existing_shortlist(session: dict) -> dict:
+    """Upgrade legacy 10-person review sessions to the full memorised shortlist."""
+    if not int(session.get("memorised_review_mode", 0)) or session.get("completed_at"):
+        return session
+    ids = _session_class_ids(session)
+    placeholders = ",".join("?" for _ in ids)
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT id FROM students WHERE class_id IN ({placeholders}) AND status=?",
+            [*ids, STATUS_MEMORISE],
+        ).fetchall()
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO session_students(session_id, student_id, initial_status)
+            VALUES (?, ?, ?)
+            """,
+            [(int(session["id"]), int(row["id"]), STATUS_MEMORISE) for row in rows],
+        )
+        refreshed = conn.execute("SELECT * FROM sessions WHERE id=?", (session["id"],)).fetchone()
+        return dict(refreshed)
+
+
+def record_shortlist_answer(
+    session_id: int,
+    student_id: int,
+    correct: bool,
+    on_date: date | None = None,
+) -> Dict:
+    """Remove one student from the shortlist; one miss immediately sends them back to Vu."""
     now = datetime.now().isoformat(timespec="seconds")
     with connect() as conn:
         session = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
@@ -126,4 +162,61 @@ def record_shortlist_answer(session_id: int, student_id: int, correct: bool) -> 
             "status": status,
             "remaining": remaining,
             "session_finished": finished,
+            "active_count": remaining,
+            "message": "",
+            "correct_count": 0,
+            "memory_dates": [],
         }
+
+
+_ORIGINAL_START = storage.start_or_resume_session
+_ORIGINAL_RECORD = storage.record_answer
+_INSTALLED = False
+
+
+def _patched_start_or_resume_session(class_ids, on_date=None):
+    session = _ORIGINAL_START(class_ids, on_date)
+    return _expand_existing_shortlist(dict(session))
+
+
+def _patched_record_answer(session_id, student_id, correct, on_date=None):
+    with connect() as conn:
+        session = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+        is_shortlist = bool(session and int(session["memorised_review_mode"]))
+    if is_shortlist:
+        return record_shortlist_answer(session_id, student_id, correct, on_date)
+    return _ORIGINAL_RECORD(session_id, student_id, correct, on_date)
+
+
+def install_runtime_behavior() -> None:
+    """Install the v0.6.1 review behavior before Streamlit loads app.py."""
+    global _INSTALLED
+    if _INSTALLED:
+        return
+
+    storage.start_or_resume_session = _patched_start_or_resume_session
+    storage.record_answer = _patched_record_answer
+
+    import streamlit as st
+
+    original_success = st.success
+    original_button = st.button
+
+    def success_with_done_hint(body, *args, **kwargs):
+        result = original_success(body, *args, **kwargs)
+        if str(body) == "C'est bon pour aujourd'hui 🎉":
+            st.caption(
+                "Tu peux changer de classe dans la barre de gauche, "
+                "ou continuer avec les élèves mémorisés."
+            )
+        return result
+
+    def button_with_shortlist_label(label, *args, **kwargs):
+        on_click = kwargs.get("on_click")
+        if str(label) == "▶️ Continuer" and getattr(on_click, "__name__", "") == "start_training":
+            label = "▶️ Continuer avec les mémorisés"
+        return original_button(label, *args, **kwargs)
+
+    st.success = success_with_done_hint
+    st.button = button_with_shortlist_label
+    _INSTALLED = True
