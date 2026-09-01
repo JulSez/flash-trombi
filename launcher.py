@@ -11,6 +11,7 @@ import paths  # noqa: F401
 import pdf_import  # noqa: F401
 import practice_mode  # noqa: F401
 import progress_view  # noqa: F401
+import shortlist_review
 import storage  # noqa: F401
 import updates  # noqa: F401
 import version  # noqa: F401
@@ -44,6 +45,7 @@ def streamlit_args(app_path: Path, port: int) -> list[str]:
         "run",
         str(app_path),
         "--global.developmentMode=false",
+        "--client.toolbarMode=minimal",
         "--server.address=127.0.0.1",
         f"--server.port={port}",
         "--server.headless=true",
@@ -53,6 +55,7 @@ def streamlit_args(app_path: Path, port: int) -> list[str]:
 
 
 def main() -> int:
+    shortlist_review.install_runtime_behavior()
     app_path = bundled_path("app.py")
     port = selected_port()
     url = f"http://127.0.0.1:{port}"
