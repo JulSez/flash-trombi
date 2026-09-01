@@ -4,6 +4,7 @@ import os
 import socket
 import sys
 import threading
+import time
 import webbrowser
 from pathlib import Path
 
@@ -15,7 +16,10 @@ import shortlist_review
 import storage  # noqa: F401
 import updates  # noqa: F401
 import version  # noqa: F401
+from streamlit.runtime.runtime import Runtime, RuntimeState
 from streamlit.web import cli as stcli
+
+TAB_CLOSE_GRACE_SECONDS = 8.0
 
 
 def free_port() -> int:
@@ -54,11 +58,48 @@ def streamlit_args(app_path: Path, port: int) -> list[str]:
     ]
 
 
+def _exit_after_last_browser_tab_closes() -> None:
+    """Stop the packaged process shortly after its last browser tab disconnects."""
+    seen_browser_session = False
+    disconnected_since: float | None = None
+
+    while True:
+        time.sleep(1.0)
+        try:
+            if not Runtime.exists():
+                continue
+            state = Runtime.instance().state
+
+            if state == RuntimeState.ONE_OR_MORE_SESSIONS_CONNECTED:
+                seen_browser_session = True
+                disconnected_since = None
+                continue
+
+            if not seen_browser_session:
+                continue
+
+            if state == RuntimeState.NO_SESSIONS_CONNECTED:
+                if disconnected_since is None:
+                    disconnected_since = time.monotonic()
+                elif time.monotonic() - disconnected_since >= TAB_CLOSE_GRACE_SECONDS:
+                    os._exit(0)
+            else:
+                disconnected_since = None
+        except Exception:
+            disconnected_since = None
+
+
 def main() -> int:
     shortlist_review.install_runtime_behavior()
     app_path = bundled_path("app.py")
     port = selected_port()
     url = f"http://127.0.0.1:{port}"
+
+    threading.Thread(
+        target=_exit_after_last_browser_tab_closes,
+        name="flash-trombi-browser-watch",
+        daemon=True,
+    ).start()
 
     if os.environ.get("FLASH_TROMBI_SKIP_BROWSER") != "1":
         threading.Timer(1.4, lambda: webbrowser.open(url)).start()
