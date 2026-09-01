@@ -18,6 +18,10 @@ class LauncherTests(unittest.TestCase):
             args.index("--server.port=8765"),
         )
 
+    def test_streamlit_args_hide_deploy_toolbar(self):
+        args = launcher.streamlit_args(Path("app.py"), 8765)
+        self.assertIn("--client.toolbarMode=minimal", args)
+
     def test_selected_port_can_be_fixed_for_packaged_smoke_test(self):
         with patch.dict(os.environ, {"FLASH_TROMBI_PORT": "8765"}, clear=False):
             self.assertEqual(8765, launcher.selected_port())
