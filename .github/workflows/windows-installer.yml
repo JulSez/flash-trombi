@@ -43,6 +43,7 @@ jobs:
           $version = python -c "from version import APP_VERSION; print(APP_VERSION)"
           "tag=v$version" >> $env:GITHUB_OUTPUT
           "name=Flash Trombi v$version" >> $env:GITHUB_OUTPUT
+          "installer=FlashTrombi_v$version.exe" >> $env:GITHUB_OUTPUT
 
       - name: Check whether release already exists
         id: release_check
@@ -104,11 +105,19 @@ jobs:
         shell: pwsh
         run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer\FlashTrombi.iss"'
 
+      - name: Verify versioned installer
+        shell: pwsh
+        run: |
+          $path = ".\installer-output\${{ steps.version.outputs.installer }}"
+          if (-not (Test-Path $path)) {
+            throw "Expected installer not found: $path"
+          }
+
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
           name: FlashTrombi-Windows
-          path: installer-output/FlashTrombi-Setup.exe
+          path: installer-output/${{ steps.version.outputs.installer }}
 
       - name: Publish GitHub Release
         if: github.event_name != 'pull_request' && steps.release_check.outputs.publish == 'true'
@@ -117,5 +126,5 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.name }}
           target_commitish: ${{ github.sha }}
-          files: installer-output/FlashTrombi-Setup.exe
+          files: installer-output/${{ steps.version.outputs.installer }}
           generate_release_notes: true
