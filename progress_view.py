@@ -41,12 +41,7 @@ def display_stage(student: dict, on_date: date | None = None) -> str:
 
 
 def mastery_points(student: dict) -> float:
-    """Return the visible mastery contribution for one student.
-
-    The bar follows the real three-day memorisation path: one memorisation day
-    is roughly one third, two days roughly two thirds, and acquisition is full.
-    Seeing a student once remains a smaller first step.
-    """
+    """Return the visible mastery contribution for one student."""
     status = str(student.get("status", "non_commence"))
     if status == "acquis":
         return 1.0
@@ -71,3 +66,15 @@ def mastery_ratio(students: Iterable[dict]) -> float:
     if not items:
         return 0.0
     return sum(mastery_points(student) for student in items) / len(items)
+
+
+def daily_completion_ratio(students: Iterable[dict], on_date: date | None = None) -> float:
+    """Share of the selection that is done for the chosen day."""
+    items = list(students)
+    if not items:
+        return 0.0
+    done = sum(
+        display_stage(student, on_date) in {STAGE_MEMORISED, STAGE_ACQUIRED}
+        for student in items
+    )
+    return done / len(items)
