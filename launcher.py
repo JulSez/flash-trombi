@@ -17,8 +17,6 @@ import updates  # noqa: F401
 import version  # noqa: F401
 from streamlit.web import cli as stcli
 
-shortlist_review.install_runtime_behavior()
-
 
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -57,6 +55,7 @@ def streamlit_args(app_path: Path, port: int) -> list[str]:
 
 
 def main() -> int:
+    shortlist_review.install_runtime_behavior()
     app_path = bundled_path("app.py")
     port = selected_port()
     url = f"http://127.0.0.1:{port}"
