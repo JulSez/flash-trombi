@@ -44,6 +44,7 @@ def streamlit_args(app_path: Path, port: int) -> list[str]:
         "run",
         str(app_path),
         "--global.developmentMode=false",
+        "--client.toolbarMode=minimal",
         "--server.address=127.0.0.1",
         f"--server.port={port}",
         "--server.headless=true",
