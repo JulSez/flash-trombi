@@ -1,5 +1,5 @@
 #define MyAppName "Flash Trombi"
-#define MyAppVersion "0.6.2"
+#define MyAppVersion "0.6.3"
 #define MyAppPublisher "Flash Trombi"
 #define MyAppExeName "FlashTrombi.exe"
 
