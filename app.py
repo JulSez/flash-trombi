@@ -42,6 +42,25 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+st.markdown(
+    """
+    <style>
+    @media (max-width: 820px) {
+      section.main div[data-testid="stHorizontalBlock"] {
+        flex-wrap: wrap;
+      }
+      section.main div[data-testid="column"] {
+        flex: 1 1 100% !important;
+        width: 100% !important;
+        min-width: 100% !important;
+      }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 init_db()
 
 NAV_TRAIN = "🎓 Entraînement"
@@ -62,7 +81,7 @@ NAV_ITEMS = [
     NAV_UPDATE,
 ]
 
-MAIN_PHOTO_WIDTH = 357
+MAIN_PHOTO_WIDTH = 300
 MEMORISED_TOAST = "3 réussites : l'élève est mémorisé"
 UPDATE_INTERVAL_SECONDS = 300
 
@@ -284,43 +303,25 @@ def daily_progress_values(active_ids: list[int]) -> tuple[list[dict], float, int
     return students, ratio, done, total
 
 
-def render_vertical_progress(ratio: float, done: int, total: int) -> None:
-    percent = max(0, min(100, round(ratio * 100)))
-    st.markdown(
-        f"""
-        <div style="display:flex;align-items:center;gap:18px;margin:8px 0 16px 0;">
-          <div style="height:210px;width:24px;background:rgba(128,128,128,.18);
-                      border-radius:14px;position:relative;overflow:hidden;">
-            <div style="position:absolute;bottom:0;left:0;right:0;height:{percent}%;
-                        background:currentColor;border-radius:14px;"></div>
-          </div>
-          <div>
-            <div style="font-size:2rem;font-weight:700;line-height:1;">{percent}%</div>
-            <div style="opacity:.75;margin-top:6px;">{done}/{total} faits aujourd'hui</div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
 def render_session_info(active_ids: list[int], session: dict | None) -> None:
     students, ratio, done, total = daily_progress_values(active_ids)
-    st.markdown("### Aujourd'hui")
-    render_vertical_progress(ratio, done, total)
+    percent = max(0, min(100, round(ratio * 100)))
 
-    counts = stage_counts(students)
+    st.markdown("### Aujourd'hui")
+    st.progress(ratio)
+    st.markdown(f"**{percent}%** · {done}/{total} faits")
+
     if session and not session.get("completed_at"):
         progress = session_progress(session["id"])
         a, b = st.columns(2)
         a.metric("Dans la série", progress["active"])
         b.metric("Tentatives", progress["attempts"])
 
+    counts = stage_counts(students)
     st.caption(
-        f"Nouveau {counts['new']} · Vu {counts['seen']} · "
-        f"Mémorisé {counts['memorised']} · À réviser {counts['review']} · "
-        f"Acquis {counts['acquired']}"
+        f"Nouveau {counts['new']} · Vu {counts['seen']} · Mémorisé {counts['memorised']}"
     )
+    st.caption(f"À réviser {counts['review']} · Acquis {counts['acquired']}")
 
 
 def _resolve_training_session(active_ids: list[int]) -> dict | None:
@@ -358,16 +359,13 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
 
     session = _resolve_training_session(active_ids)
 
+    main_area, analytics = st.columns([2.05, 1], gap="large")
+
     if session and session.get("completed_at"):
-        left, center, right = st.columns([0.9, 1.15, 1.1], gap="large")
-        with left:
-            render_session_info(active_ids, session)
-        with center:
+        with main_area:
             st.markdown("## Session terminée 🎉")
             st.write("Tous les élèves de cette sélection sont mémorisés pour aujourd'hui ou acquis.")
             st.caption("Tu peux choisir une autre classe à gauche, ou continuer avec les mémorisés.")
-        with right:
-            st.markdown("### Et maintenant ?")
             st.button(
                 "▶️ Continuer avec les mémorisés",
                 type="primary",
@@ -375,17 +373,14 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
                 on_click=start_training,
                 args=(list(active_ids),),
             )
-            st.caption("Une réussite retire l'élève de la short-list. Une erreur le repasse en Vu.")
+        with analytics:
+            render_session_info(active_ids, session)
         return
 
     if not session:
-        left, center, right = st.columns([0.9, 1.15, 1.1], gap="large")
-        with left:
-            render_session_info(active_ids, None)
-        with center:
+        with main_area:
             st.markdown("## Prêt ?")
             st.write("Lance une série sur la sélection actuelle.")
-        with right:
             st.button(
                 "▶️ Commencer",
                 type="primary",
@@ -396,6 +391,8 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
             error = st.session_state.pop("friendly_error", None)
             if error:
                 st.warning(error)
+        with analytics:
+            render_session_info(active_ids, None)
         return
 
     if st.session_state.get("current_student") is None:
@@ -407,18 +404,12 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
         st.session_state.pop("current_student", None)
         st.rerun()
 
-    left, center, right = st.columns([0.9, 1.15, 1.1], gap="large")
-
-    with left:
-        render_session_info(active_ids, session)
-
-    with center:
-        st.image(student["photo_path"], caption="Qui est cet élève ?", width=MAIN_PHOTO_WIDTH)
+    with main_area:
+        st.image(student["photo_path"], width=MAIN_PHOTO_WIDTH)
+        st.markdown("### Quel est son nom ?")
         st.caption(f"{student.get('class_name', '')} · {STAGE_LABELS[display_stage(student)]}")
 
-    with right:
         if not st.session_state.get("answer_revealed", False):
-            st.markdown("### Donne son nom")
             st.button(
                 "👀 Afficher le nom",
                 type="primary",
@@ -426,7 +417,6 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
                 on_click=reveal_answer,
             )
         else:
-            st.markdown("### Réponse")
             show_answer(student)
             st.markdown("#### Tu l'avais ?")
             yes, no = st.columns(2)
@@ -453,6 +443,9 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
         error = st.session_state.pop("friendly_error", None)
         if error:
             st.warning(error)
+
+    with analytics:
+        render_session_info(active_ids, session)
 
 
 def page_random(classes: list[dict], active_ids: list[int]) -> None:
