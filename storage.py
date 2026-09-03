@@ -19,6 +19,7 @@ STATUS_NON_COMMENCE = "non_commence"
 STATUS_VU = "vu"
 STATUS_MEMORISE = "memorise"
 STATUS_ACQUIS = "acquis"
+SESSION_TARGET_SIZE = 10
 
 STATUS_LABELS = {
     STATUS_NON_COMMENCE: "Non commencé",
@@ -567,6 +568,30 @@ def _replenish_session(
     return added
 
 
+def _fill_session_with_acquired(
+    conn: sqlite3.Connection,
+    session_id: int,
+    today: str,
+    target: int = SESSION_TARGET_SIZE,
+) -> int:
+    """Fill a short session with acquired pupils without displacing pupils who need work."""
+    session = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if not session or session["completed_at"]:
+        return 0
+
+    added = 0
+    while _active_count(conn, session_id) < target:
+        excluded = _already_in_session(conn, session_id)
+        _, _, _, acquired = _eligible_rows(
+            conn, _session_class_ids(session), excluded, today
+        )
+        if not acquired:
+            break
+        _add_student_to_session(conn, session_id, acquired[0])
+        added += 1
+    return added
+
+
 def start_or_resume_session(
     class_ids: int | Sequence[int], on_date: Optional[date] = None
 ) -> Dict:
@@ -618,6 +643,8 @@ def start_or_resume_session(
                 )
                 for student in memorised[:10]:
                     _add_student_to_session(conn, session_id, student)
+
+        _fill_session_with_acquired(conn, session_id, today)
 
         if _active_count(conn, session_id) == 0:
             conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
@@ -826,7 +853,26 @@ def record_answer(
                     (session_id, student_id),
                 )
                 correct_count = 0
+                completed = 1
                 message = "Oublié : retour à Vu, nouveau cycle à zéro."
+
+        elif student["status"] == STATUS_ACQUIS:
+            if correct:
+                completed = 1
+                message = "Toujours acquis 👍"
+            else:
+                new_cycle = int(student["cycle_no"]) + 1
+                conn.execute(
+                    "UPDATE students SET status=?, cycle_no=? WHERE id=?",
+                    (STATUS_VU, new_cycle, student_id),
+                )
+                conn.execute(
+                    "UPDATE session_students SET correct_count=0 WHERE session_id=? AND student_id=?",
+                    (session_id, student_id),
+                )
+                correct_count = 0
+                completed = 1
+                message = "À retravailler : retour à Vu."
 
         elif student["status"] == STATUS_MEMORISE:
             if correct:
@@ -885,7 +931,12 @@ def record_answer(
                 else:
                     message = f"Bonne réponse : {correct_count}/3 dans cette session."
             else:
-                message = f"À revoir — {correct_count}/3 bonnes réponses pour l'instant."
+                correct_count = 0
+                conn.execute(
+                    "UPDATE session_students SET correct_count=0 WHERE session_id=? AND student_id=?",
+                    (session_id, student_id),
+                )
+                message = "À revoir — la série repart à 0/3."
 
         if completed:
             conn.execute(
@@ -900,6 +951,7 @@ def record_answer(
                 today,
                 prefer_non_started=became_memorised_today,
             )
+            _fill_session_with_acquired(conn, session_id, today)
 
         refreshed = conn.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
         dates = memory_dates(conn, student_id, int(refreshed["cycle_no"]))
