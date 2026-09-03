@@ -25,11 +25,9 @@ training = training.replace('        st.markdown("### Quel est son nom ?")', '  
 training = training.replace("                use_container_width=True,\n", "")
 training = training.replace("            use_container_width=True,\n", "")
 training = training.replace(
-    '        st.divider()\n        if st.button("⏹️ Arrêter la session"):',
-    '        if st.button("⏹️ Arrêter"): ',
+    '        st.divider()\n        if st.button("⏹️ Arrêter la session", use_container_width=True):',
+    '        if st.button("⏹️ Arrêter"):',
 )
-# Normalize the compact stop button line if the replacement above matched.
-training = training.replace('if st.button("⏹️ Arrêter"): \n', 'if st.button("⏹️ Arrêter"):\n')
 text = text[:training_start] + training + text[training_end:]
 
 progress_start = text.index("def page_progress(")
