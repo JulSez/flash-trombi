@@ -133,7 +133,7 @@ def record_shortlist_answer(
         )
 
         status = str(student["status"])
-        if not correct and status == STATUS_MEMORISE:
+        if not correct and status in {STATUS_MEMORISE, storage.STATUS_ACQUIS}:
             conn.execute(
                 "UPDATE students SET status=?, cycle_no=? WHERE id=?",
                 (STATUS_VU, int(student["cycle_no"]) + 1, student_id),
