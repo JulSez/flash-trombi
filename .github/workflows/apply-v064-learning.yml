@@ -1,0 +1,36 @@
+name: Apply v0.6.4 learning patch
+
+on:
+  push:
+    branches:
+      - fix/v0.6.4-learning-and-session-balance
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ !contains(github.event.head_commit.message, '[v064-learning-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/v0.6.4-learning-and-session-balance
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Patch learning engine
+        run: python scripts/apply_v064_learning.py
+      - name: Commit patched learning engine
+        shell: bash
+        run: |
+          if git diff --quiet -- storage.py shortlist_review.py; then
+            echo "No learning patch needed."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add storage.py shortlist_review.py
+          git commit -m "Apply v0.6.4 learning changes [v064-learning-applied]"
+          git push origin HEAD:fix/v0.6.4-learning-and-session-balance
