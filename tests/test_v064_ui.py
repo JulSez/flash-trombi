@@ -14,7 +14,9 @@ class V064UiTests(unittest.TestCase):
         start = self.source.index("def page_training(")
         end = self.source.index("\ndef page_random(", start)
         training = self.source[start:end]
-        self.assertIn('st.markdown("**Quel est son nom ?**")', training)
+        self.assertIn('training-question', training)
+        self.assertIn('key="training_answer_buttons"', training)
+        self.assertIn('wrap=False', training)
         self.assertNotIn("use_container_width=True", training)
         self.assertIn('st.button("⏹️ Arrêter")', training)
 
