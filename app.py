@@ -81,7 +81,7 @@ NAV_ITEMS = [
     NAV_UPDATE,
 ]
 
-MAIN_PHOTO_WIDTH = 300
+MAIN_PHOTO_WIDTH = 270
 MEMORISED_TOAST = "3 réussites : l'élève est mémorisé"
 UPDATE_INTERVAL_SECONDS = 300
 
@@ -102,7 +102,7 @@ def selected_students(class_ids: list[int]) -> list[dict]:
 
 def show_answer(student: dict) -> None:
     if student.get("first_name") or student.get("last_name"):
-        st.markdown(f"## {student_display_name(student)}")
+        st.markdown(f"### {student_display_name(student)}")
         return
 
     label_path = student.get("label_path")
@@ -369,7 +369,6 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
             st.button(
                 "▶️ Continuer avec les mémorisés",
                 type="primary",
-                use_container_width=True,
                 on_click=start_training,
                 args=(list(active_ids),),
             )
@@ -384,7 +383,6 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
             st.button(
                 "▶️ Commencer",
                 type="primary",
-                use_container_width=True,
                 on_click=start_training,
                 args=(list(active_ids),),
             )
@@ -406,14 +404,13 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
 
     with main_area:
         st.image(student["photo_path"], width=MAIN_PHOTO_WIDTH)
-        st.markdown("### Quel est son nom ?")
+        st.markdown("**Quel est son nom ?**")
         st.caption(f"{student.get('class_name', '')} · {STAGE_LABELS[display_stage(student)]}")
 
         if not st.session_state.get("answer_revealed", False):
             st.button(
                 "👀 Afficher le nom",
                 type="primary",
-                use_container_width=True,
                 on_click=reveal_answer,
             )
         else:
@@ -423,19 +420,16 @@ def page_training(classes: list[dict], active_ids: list[int]) -> None:
             yes.button(
                 "✅ Oui",
                 type="primary",
-                use_container_width=True,
                 on_click=answer_current,
                 args=(True,),
             )
             no.button(
                 "❌ Non",
-                use_container_width=True,
                 on_click=answer_current,
                 args=(False,),
             )
 
-        st.divider()
-        if st.button("⏹️ Arrêter la session", use_container_width=True):
+        if st.button("⏹️ Arrêter"):
             end_session(session["id"])
             _clear_working_selection_state()
             st.rerun()
@@ -495,12 +489,11 @@ def page_progress(classes: list[dict], active_ids: list[int]) -> None:
     if not classes:
         st.info("Ajoute une classe pour commencer.")
         return
-    if not active_ids:
-        st.info("Choisis au moins une classe dans la barre de gauche.")
-        return
 
-    students, daily_ratio, done, total = daily_progress_values(active_ids)
+    all_ids = [int(row["id"]) for row in classes]
+    students, daily_ratio, done, total = daily_progress_values(all_ids)
     mastery = mastery_ratio(students)
+    st.caption("Vue d'ensemble · toutes les classes")
 
     a, b = st.columns(2)
     with a:
@@ -510,7 +503,7 @@ def page_progress(classes: list[dict], active_ids: list[int]) -> None:
     with b:
         st.markdown("### Maîtrise globale")
         st.progress(mastery)
-        st.caption(f"{round(mastery * 100)} % de maîtrise sur la sélection")
+        st.caption(f"{round(mastery * 100)} % de maîtrise sur toutes les classes")
 
     counts = stage_counts(students)
     cols = st.columns(5)
@@ -521,8 +514,6 @@ def page_progress(classes: list[dict], active_ids: list[int]) -> None:
     st.subheader("Par classe")
     for row in classes:
         class_id = int(row["id"])
-        if class_id not in active_ids:
-            continue
         class_students = get_students(class_id)
         class_daily = daily_completion_ratio(class_students)
         class_mastery = mastery_ratio(class_students)
@@ -534,7 +525,6 @@ def page_progress(classes: list[dict], active_ids: list[int]) -> None:
             c2.caption(f"Aujourd'hui · {round(class_daily * 100)} %")
             c3.progress(class_mastery)
             c3.caption(f"Maîtrise · {round(class_mastery * 100)} %")
-
 
 def page_add_class() -> None:
     st.title("➕ Ajouter une classe")
