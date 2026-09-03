@@ -3,9 +3,9 @@ from __future__ import annotations
 import sqlite3
 import unittest
 from contextlib import contextmanager
+from datetime import date
 from unittest.mock import patch
 
-import learning_rules
 import storage
 
 
@@ -95,35 +95,48 @@ class LearningRulesV064Tests(unittest.TestCase):
             (student_id, f"Eleve{student_id}", "TEST", position, status),
         )
 
-    def test_one_miss_resets_learning_streak_to_zero(self):
-        self.add_student(1, storage.STATUS_VU, 1)
+    def add_to_session(self, student_id: int, status: str) -> None:
         self.conn.execute(
-            """
-            INSERT INTO session_students(session_id, student_id, initial_status, correct_count)
-            VALUES (1, 1, 'vu', 2)
-            """
+            "INSERT INTO session_students(session_id, student_id, initial_status) VALUES (1, ?, ?)",
+            (student_id, status),
         )
         self.conn.commit()
 
-        learning_rules._reset_learning_streak_on_miss(1, 1, False)
+    def test_miss_breaks_the_three_success_streak(self):
+        self.add_student(1, storage.STATUS_VU, 1)
+        self.add_to_session(1, storage.STATUS_VU)
 
-        count = self.conn.execute(
-            "SELECT correct_count FROM session_students WHERE session_id=1 AND student_id=1"
-        ).fetchone()["correct_count"]
-        self.assertEqual(0, count)
+        storage.record_answer(1, 1, True, date(2026, 9, 4))
+        storage.record_answer(1, 1, True, date(2026, 9, 4))
+        missed = storage.record_answer(1, 1, False, date(2026, 9, 4))
+        after_miss = storage.record_answer(1, 1, True, date(2026, 9, 4))
+
+        self.assertEqual(0, missed["correct_count"])
+        self.assertEqual(1, after_miss["correct_count"])
+        self.assertEqual(storage.STATUS_VU, after_miss["status"])
+
+    def test_three_consecutive_successes_are_required_after_a_miss(self):
+        self.add_student(1, storage.STATUS_VU, 1)
+        self.add_to_session(1, storage.STATUS_VU)
+
+        storage.record_answer(1, 1, True, date(2026, 9, 4))
+        storage.record_answer(1, 1, False, date(2026, 9, 4))
+        storage.record_answer(1, 1, True, date(2026, 9, 4))
+        storage.record_answer(1, 1, True, date(2026, 9, 4))
+        result = storage.record_answer(1, 1, True, date(2026, 9, 4))
+
+        self.assertEqual(storage.STATUS_MEMORISE, result["status"])
+        self.assertEqual(3, result["correct_count"])
 
     def test_three_memorised_are_completed_with_seven_acquired_fillers(self):
         for student_id in range(1, 4):
             self.add_student(student_id, storage.STATUS_MEMORISE, student_id)
-            self.conn.execute(
-                "INSERT INTO session_students(session_id, student_id, initial_status) VALUES (1, ?, 'memorise')",
-                (student_id,),
-            )
+            self.add_to_session(student_id, storage.STATUS_MEMORISE)
         for student_id in range(4, 11):
             self.add_student(student_id, storage.STATUS_ACQUIS, student_id)
         self.conn.commit()
 
-        added = learning_rules._fill_with_acquired(1)
+        added = storage._fill_session_with_acquired(self.conn, 1, "2026-09-04")
 
         active = self.conn.execute(
             "SELECT COUNT(*) AS n FROM session_students WHERE session_id=1 AND completed=0"
@@ -141,12 +154,9 @@ class LearningRulesV064Tests(unittest.TestCase):
 
     def test_missed_acquired_filler_returns_to_seen(self):
         self.add_student(1, storage.STATUS_ACQUIS, 1)
-        self.conn.execute(
-            "INSERT INTO session_students(session_id, student_id, initial_status) VALUES (1, 1, 'acquis')"
-        )
-        self.conn.commit()
+        self.add_to_session(1, storage.STATUS_ACQUIS)
 
-        result = learning_rules._record_acquired_answer(1, 1, False)
+        result = storage.record_answer(1, 1, False, date(2026, 9, 4))
 
         student = self.conn.execute("SELECT status, cycle_no FROM students WHERE id=1").fetchone()
         session_student = self.conn.execute(
