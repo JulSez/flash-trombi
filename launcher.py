@@ -8,6 +8,7 @@ import time
 import webbrowser
 from pathlib import Path
 
+import learning_rules
 import paths  # noqa: F401
 import pdf_import  # noqa: F401
 import practice_mode  # noqa: F401
@@ -91,6 +92,7 @@ def _exit_after_last_browser_tab_closes() -> None:
 
 def main() -> int:
     shortlist_review.install_runtime_behavior()
+    learning_rules.install_runtime_behavior()
     app_path = bundled_path("app.py")
     port = selected_port()
     url = f"http://127.0.0.1:{port}"
